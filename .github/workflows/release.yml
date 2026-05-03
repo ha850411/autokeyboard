@@ -1,0 +1,43 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - "v*"  # 當推送 v1.0.0 這樣的 tag 時觸發
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install pyinstaller pynput
+
+      - name: Build exe with PyInstaller
+        run: |
+          pyinstaller AutoKeyboard.spec
+
+      - name: Copy scripts.json to dist
+        run: |
+          copy scripts.json dist\scripts.json
+
+      - name: Build installer with Inno Setup
+        uses: Minionguyjpro/Inno-Setup-Action@v1.2.4
+        with:
+          filepath: installer.iss
+          options: /O"installer"
+
+      - name: Upload installer to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: installer/AutoKeyboard_Setup.exe
+          generate_release_notes: true
