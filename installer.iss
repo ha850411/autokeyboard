@@ -20,10 +20,17 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 [Files]
 Source: "dist\AutoKeyboard.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "dist\scripts.json"; DestDir: "{app}"; Flags: ignoreversion onlyifdoesntexist
+Source: "assets\icon.ico"; DestDir: "{app}\assets"; Flags: ignoreversion
 
 [Icons]
-Name: "{group}\AutoKeyboard"; Filename: "{app}\AutoKeyboard.exe"
-Name: "{autodesktop}\AutoKeyboard"; Filename: "{app}\AutoKeyboard.exe"; Tasks: desktopicon
+Name: "{group}\AutoKeyboard"; Filename: "{app}\AutoKeyboard.exe"; IconFilename: "{app}\assets\icon.ico"
+Name: "{group}\{cm:UninstallProgram,AutoKeyboard}"; Filename: "{uninstallexe}"
+Name: "{autodesktop}\AutoKeyboard"; Filename: "{app}\AutoKeyboard.exe"; IconFilename: "{app}\assets\icon.ico"; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\AutoKeyboard.exe"; Description: "{cm:LaunchProgram,AutoKeyboard}"; Flags: nowait postinstall skipifsilent
+
+[UninstallDelete]
+Type: files; Name: "{app}\scripts.json"
+Type: dirifempty; Name: "{app}\assets"
+Type: dirifempty; Name: "{app}"

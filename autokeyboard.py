@@ -947,6 +947,7 @@ class AutoKeyboardApp:
         self.root.title(APP_TITLE)
         self.root.geometry("1120x720")
         self.root.minsize(980, 620)
+        self._set_window_icon()
 
         self.scripts = load_scripts()
         self.keyboard = WindowsKeyboard()
@@ -977,6 +978,14 @@ class AutoKeyboardApp:
         self._register_hotkeys(show_dialog=False)
         self._poll_events()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _set_window_icon(self) -> None:
+        ico_path = app_directory() / "assets" / "icon.ico"
+        if ico_path.exists():
+            try:
+                self.root.iconbitmap(default=str(ico_path))
+            except Exception:
+                pass
 
     def _configure_style(self) -> None:
         style = ttk.Style()
