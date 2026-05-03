@@ -1,0 +1,22 @@
+{
+  "scripts": [
+    {
+      "id": "adda34ca-1876-4b82-94f6-fb4e031fd63d",
+      "name": "範例：每秒按一次 Space",
+      "hotkey": "F8",
+      "repeat": true,
+      "steps": [
+        {
+          "key": "SPACE",
+          "press_ms": 100,
+          "wait_ms": 900
+        },
+        {
+          "key": "SPACE",
+          "press_ms": 100,
+          "wait_ms": 900
+        }
+      ]
+    }
+  ]
+}
