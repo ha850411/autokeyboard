@@ -1441,6 +1441,8 @@ class AutoKeyboardApp:
         self.step_tree.bind("<Control-C>", self._copy_selected_steps_event)
         self.step_tree.bind("<Control-v>", self._paste_steps_event)
         self.step_tree.bind("<Control-V>", self._paste_steps_event)
+        self.step_tree.bind("<Control-a>", self._select_all_steps_event)
+        self.step_tree.bind("<Control-A>", self._select_all_steps_event)
         self.step_tree.bind("<ButtonPress-1>", self._on_step_drag_start)
         self.step_tree.bind("<B1-Motion>", self._on_step_drag_motion)
         self.step_tree.bind("<ButtonRelease-1>", self._on_step_drag_release)
@@ -1477,7 +1479,7 @@ class AutoKeyboardApp:
         )
         key_mode_options = ttk.Frame(self.key_settings_frame, style="Panel.TFrame")
         key_mode_options.grid(row=0, column=1, columnspan=2, sticky="w", padx=(0, 6))
-        for column, mode in enumerate((KEY_MODE_DOWN, KEY_MODE_UP, KEY_MODE_BOTH)):
+        for column, mode in enumerate((KEY_MODE_BOTH, KEY_MODE_DOWN, KEY_MODE_UP)):
             ttk.Radiobutton(
                 key_mode_options,
                 text=KEY_MODE_LABELS[mode],
@@ -2272,9 +2274,8 @@ class AutoKeyboardApp:
         script.steps[start_index:start_index] = steps
         self._save_all()
         self._refresh_step_tree(script)
-        end_index = start_index + len(steps)
-        self.step_tree.selection_set(*[str(index) for index in range(start_index, end_index)])
-        self.step_tree.focus(str(start_index))
+        self.step_tree.selection_remove(*self.step_tree.selection())
+        self.step_tree.focus("")
         self.status_var.set(f"已在第 {start_index + 1} 格新增 {len(steps)} 個指令。")
 
     def _schedule_auto_save_selected_step(self, *_args) -> None:
@@ -2355,6 +2356,14 @@ class AutoKeyboardApp:
         self._paste_steps_from_clipboard()
         return "break"
 
+    def _select_all_steps_event(self, _event: tk.Event | None = None) -> str:
+        items = self.step_tree.get_children()
+        if items:
+            self.step_tree.selection_set(*items)
+            self.step_tree.focus(items[0])
+            self.status_var.set(f"已選取 {len(items)} 個步驟。")
+        return "break"
+
     def _copy_selected_steps_to_clipboard(self) -> None:
         script = self._selected_script()
         indices = self._selected_step_indices()
@@ -2400,6 +2409,13 @@ class AutoKeyboardApp:
         self._step_drag_start_row = None
         self._step_drag_started_on_selection = False
         self._clear_step_drag_preview()
+
+    def _clear_step_selection(self) -> None:
+        selection = self.step_tree.selection()
+        if selection:
+            self.step_tree.selection_remove(*selection)
+        self.step_tree.focus("")
+        self.status_var.set("已取消步驟選取；新增步驟會加到最後。")
 
     def _clear_step_drag_preview(self) -> None:
         self._stop_step_drag_pulse()
@@ -2468,6 +2484,9 @@ class AutoKeyboardApp:
         row = self.step_tree.identify_row(event.y)
         if not row:
             self._reset_step_drag_state()
+            if self.step_tree.identify_region(event.x, event.y) != "heading":
+                self._clear_step_selection()
+                return "break"
             return None
 
         self._step_drag_start_y = event.y
