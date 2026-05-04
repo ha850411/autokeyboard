@@ -19,7 +19,6 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 
 [Files]
 Source: "dist\AutoKeyboard.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "dist\scripts.json"; DestDir: "{app}"; Flags: ignoreversion onlyifdoesntexist
 
 [Icons]
 Name: "{group}\AutoKeyboard"; Filename: "{app}\AutoKeyboard.exe"

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import ctypes
 import json
+import os
 import platform
 import queue
 import sys
@@ -20,6 +21,8 @@ from tkinter import messagebox, ttk
 
 
 APP_TITLE = "AutoKeyboard 腳本精靈"
+APP_NAME = "AutoKeyboard"
+CONFIG_FILENAME = "scripts.json"
 
 
 def app_directory() -> Path:
@@ -28,7 +31,16 @@ def app_directory() -> Path:
     return Path(__file__).resolve().parent
 
 
-CONFIG_PATH = app_directory() / "scripts.json"
+def user_data_directory() -> Path:
+    if platform.system() == "Windows":
+        fallback = Path.home() / "AppData" / "Local"
+        base_directory = Path(os.environ.get("LOCALAPPDATA", str(fallback)))
+        return base_directory / APP_NAME
+    return Path.home() / f".{APP_NAME.lower()}"
+
+
+LEGACY_CONFIG_PATH = app_directory() / CONFIG_FILENAME
+CONFIG_PATH = user_data_directory() / CONFIG_FILENAME
 
 
 if platform.system() == "Windows":
@@ -672,20 +684,33 @@ def default_scripts() -> list[Script]:
     ]
 
 
-def load_scripts() -> list[Script]:
-    if not CONFIG_PATH.exists():
-        return default_scripts()
+def _copy_legacy_config_if_needed() -> None:
+    if CONFIG_PATH.exists() or not LEGACY_CONFIG_PATH.exists() or LEGACY_CONFIG_PATH == CONFIG_PATH:
+        return
 
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(LEGACY_CONFIG_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+
+
+def _read_scripts_from_config(path: Path) -> list[Script]:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    return [Script.from_dict(item) for item in data.get("scripts", [])]
+
+
+def load_scripts() -> list[Script]:
     try:
-        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-        return [Script.from_dict(item) for item in data.get("scripts", [])]
+        _copy_legacy_config_if_needed()
+        if not CONFIG_PATH.exists():
+            return default_scripts()
+        return _read_scripts_from_config(CONFIG_PATH)
     except Exception as exc:
-        messagebox.showwarning(APP_TITLE, f"讀取 scripts.json 失敗，已載入預設範例。\n\n{exc}")
+        messagebox.showwarning(APP_TITLE, f"讀取設定檔失敗，已載入預設範例。\n\n{exc}")
         return default_scripts()
 
 
 def save_scripts(scripts: list[Script]) -> None:
     data = {"scripts": [script.to_dict() for script in scripts]}
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
@@ -842,6 +867,12 @@ class ScriptRunner:
     def stop(self) -> None:
         self._stop_event.set()
 
+    def join(self, timeout: float | None = None) -> bool:
+        if self._thread.ident is None:
+            return True
+        self._thread.join(timeout)
+        return not self._thread.is_alive()
+
     def _delay_with_held_keys(self, delay_ms: int, held_actions: list[KeyAction]) -> bool:
         if delay_ms <= 0:
             return self._stop_event.is_set()
@@ -956,8 +987,10 @@ class AutoKeyboardApp:
         self.current_step: dict[str, str] = {}
         self._loading_script = False
         self._recording_hotkey = False
+        self._closing = False
         self._auto_save_after_id: str | None = None
         self._hotkey_register_after_id: str | None = None
+        self._poll_after_id: str | None = None
 
         self.name_var = tk.StringVar()
         self.hotkey_var = tk.StringVar()
@@ -2195,6 +2228,9 @@ class AutoKeyboardApp:
                 self.status_var.set(f"正在停止「{script.name}」。")
 
     def _poll_events(self) -> None:
+        if self._closing:
+            return
+
         while True:
             try:
                 script_id = self.hotkeys.events.get_nowait()
@@ -2219,12 +2255,28 @@ class AutoKeyboardApp:
                 self.current_step.pop(script_id, None)
             self._refresh_script_tree()
 
-        self.root.after(80, self._poll_events)
+        self._poll_after_id = self.root.after(80, self._poll_events)
 
     def _on_close(self) -> None:
+        if self._closing:
+            return
+
+        self._closing = True
+        for after_id in (self._poll_after_id, self._auto_save_after_id, self._hotkey_register_after_id):
+            if after_id is None:
+                continue
+            try:
+                self.root.after_cancel(after_id)
+            except tk.TclError:
+                pass
+
         for runner in list(self.runners.values()):
             runner.stop()
         self.hotkeys.close()
+        deadline = time.monotonic() + 1.0
+        for runner in list(self.runners.values()):
+            remaining = deadline - time.monotonic()
+            runner.join(max(remaining, 0.0))
         self.root.destroy()
 
 
