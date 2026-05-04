@@ -986,9 +986,11 @@ class AutoKeyboardApp:
         self.runners: dict[str, ScriptRunner] = {}
         self.current_step: dict[str, str] = {}
         self._loading_script = False
+        self._loading_step = False
         self._recording_hotkey = False
         self._closing = False
         self._auto_save_after_id: str | None = None
+        self._auto_save_step_after_id: str | None = None
         self._hotkey_register_after_id: str | None = None
         self._poll_after_id: str | None = None
 
@@ -1132,6 +1134,8 @@ class AutoKeyboardApp:
         )
         style.configure("TCheckbutton", background=colors["surface"], foreground=colors["text"])
         style.map("TCheckbutton", background=[("active", colors["surface"])])
+        style.configure("TRadiobutton", background=colors["surface"], foreground=colors["text"])
+        style.map("TRadiobutton", background=[("active", colors["surface"])])
 
     def _build_ui(self) -> None:
         self.root.columnconfigure(0, weight=1)
@@ -1252,15 +1256,22 @@ class AutoKeyboardApp:
         step_form.columnconfigure(1, weight=1)
 
         ttk.Label(step_form, text="動作", style="Panel.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 6))
-        self.step_action_combo = ttk.Combobox(
-            step_form,
-            textvariable=self.step_action_var,
-            values=list(FORM_ACTION_LABELS.values()),
-            state="readonly",
-            width=12,
-        )
-        self.step_action_combo.grid(row=0, column=1, sticky="ew", padx=(0, 10))
-        self.step_action_combo.bind("<<ComboboxSelected>>", self._on_step_action_changed)
+        action_options = ttk.Frame(step_form, style="Panel.TFrame")
+        action_options.grid(row=0, column=1, sticky="w", padx=(0, 10))
+        ttk.Radiobutton(
+            action_options,
+            text=FORM_ACTION_LABELS[FORM_ACTION_KEY_COMMAND],
+            value=FORM_ACTION_LABELS[FORM_ACTION_KEY_COMMAND],
+            variable=self.step_action_var,
+            command=self._on_step_action_changed,
+        ).grid(row=0, column=0, sticky="w", padx=(0, 14))
+        ttk.Radiobutton(
+            action_options,
+            text=FORM_ACTION_LABELS[FORM_ACTION_DELAY],
+            value=FORM_ACTION_LABELS[FORM_ACTION_DELAY],
+            variable=self.step_action_var,
+            command=self._on_step_action_changed,
+        ).grid(row=0, column=1, sticky="w")
 
         self.key_settings_frame = ttk.Frame(step_form, style="Panel.TFrame")
         self.key_settings_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
@@ -1298,29 +1309,23 @@ class AutoKeyboardApp:
 
         step_buttons = ttk.Frame(right, style="Toolbar.TFrame")
         step_buttons.grid(row=5, column=0, sticky="ew", pady=(10, 0))
-        for column in range(7):
+        for column in range(5):
             step_buttons.columnconfigure(column, weight=1)
 
-        ttk.Button(step_buttons, text="錄製多步驟", style="Primary.TButton", command=self._record_steps).grid(
+        ttk.Button(step_buttons, text="新增步驟", style="Primary.TButton", command=self._add_step).grid(
             row=0, column=0, sticky="ew", padx=(0, 4)
         )
-        ttk.Button(step_buttons, text="新增步驟", style="Ghost.TButton", command=self._add_step).grid(
+        ttk.Button(step_buttons, text="複製指令", style="Ghost.TButton", command=self._copy_steps).grid(
             row=0, column=1, sticky="ew", padx=4
         )
-        ttk.Button(step_buttons, text="更新步驟", style="Ghost.TButton", command=self._update_step).grid(
+        ttk.Button(step_buttons, text="刪除步驟", style="Danger.TButton", command=self._delete_step).grid(
             row=0, column=2, sticky="ew", padx=4
         )
-        ttk.Button(step_buttons, text="複製指令", style="Ghost.TButton", command=self._copy_steps).grid(
+        ttk.Button(step_buttons, text="上移", style="Ghost.TButton", command=lambda: self._move_step(-1)).grid(
             row=0, column=3, sticky="ew", padx=4
         )
-        ttk.Button(step_buttons, text="刪除步驟", style="Danger.TButton", command=self._delete_step).grid(
-            row=0, column=4, sticky="ew", padx=4
-        )
-        ttk.Button(step_buttons, text="上移", style="Ghost.TButton", command=lambda: self._move_step(-1)).grid(
-            row=0, column=5, sticky="ew", padx=4
-        )
         ttk.Button(step_buttons, text="下移", style="Ghost.TButton", command=lambda: self._move_step(1)).grid(
-            row=0, column=6, sticky="ew", padx=(4, 0)
+            row=0, column=4, sticky="ew", padx=(4, 0)
         )
 
         ttk.Label(
@@ -1536,6 +1541,8 @@ class AutoKeyboardApp:
     def _bind_auto_save(self) -> None:
         for variable in (self.name_var, self.hotkey_var, self.repeat_var):
             variable.trace_add("write", self._schedule_auto_save_script_settings)
+        for variable in (self.step_action_var, self.step_key_var, self.step_delay_ms_var):
+            variable.trace_add("write", self._schedule_auto_save_selected_step)
 
     def _schedule_auto_save_script_settings(self, *_args) -> None:
         if self._loading_script:
@@ -1853,161 +1860,6 @@ class AutoKeyboardApp:
             return None
         return KEYCODE_TEXT.get(keycode)
 
-    def _record_steps(self) -> None:
-        script = self._selected_script()
-        if script is None:
-            return
-
-        window = tk.Toplevel(self.root)
-        window.title("錄製多步驟")
-        window.transient(self.root)
-        window.grab_set()
-        window.geometry("520x420")
-        window.minsize(480, 380)
-        window.configure(bg=self.colors["bg"])
-        window.columnconfigure(0, weight=1)
-        window.rowconfigure(0, weight=1)
-
-        recorded: list[Step] = []
-        active: dict[str, tuple[str, float]] = {}
-        last_event_at: list[float | None] = [None]
-
-        frame = ttk.Frame(window, style="Panel.TFrame", padding=14)
-        frame.grid(row=0, column=0, sticky="nsew")
-        frame.columnconfigure(0, weight=1)
-        frame.rowconfigure(2, weight=1)
-
-        ttk.Label(frame, text="錄製按鍵步驟", style="Title.TLabel").grid(row=0, column=0, sticky="w")
-        preview_var = tk.StringVar(value="此視窗取得焦點時，按下的按鍵會被錄製。")
-        capture_area = ttk.Frame(frame, style="Panel.TFrame", padding=(0, 8))
-        capture_area.grid(row=1, column=0, sticky="ew")
-        capture_area.columnconfigure(0, weight=1)
-        ttk.Label(capture_area, textvariable=preview_var, style="Small.TLabel").grid(row=0, column=0, sticky="w")
-
-        record_tree = ttk.Treeview(frame, columns=("action", "key", "delay"), show="headings", height=9)
-        record_tree.heading("action", text="動作")
-        record_tree.heading("key", text="按鍵")
-        record_tree.heading("delay", text="延遲 ms")
-        record_tree.column("action", width=120, minwidth=100)
-        record_tree.column("key", width=190, minwidth=150)
-        record_tree.column("delay", width=110, minwidth=90, anchor="center")
-        record_tree.grid(row=2, column=0, sticky="nsew")
-
-        buttons = ttk.Frame(frame, style="Toolbar.TFrame")
-        buttons.grid(row=3, column=0, sticky="ew", pady=(10, 0))
-        for column in range(4):
-            buttons.columnconfigure(column, weight=1)
-
-        def event_key_id(event: tk.Event) -> str:
-            keycode = getattr(event, "keycode", "")
-            return f"{keycode}:{event.keysym}"
-
-        def add_preview_step(step: Step) -> None:
-            key = step.key if step.needs_key() else ""
-            delay = str(step.delay_ms) if step.action == ACTION_DELAY else ""
-            record_tree.insert(
-                "",
-                "end",
-                iid=str(len(recorded) - 1),
-                values=(step.display_action(), key, delay),
-            )
-
-        def append_recorded_step(step: Step) -> None:
-            recorded.append(step)
-            add_preview_step(step)
-
-        def on_press(event: tk.Event) -> str:
-            key_id = event_key_id(event)
-            if key_id in active:
-                return "break"
-
-            key_text = self._tk_event_to_key_text(
-                event,
-                include_modifiers=False,
-                allow_modifier_key=True,
-            )
-            if key_text is None:
-                return "break"
-
-            now = time.perf_counter()
-            if last_event_at[0] is not None:
-                gap_ms = max(0, int(round((now - last_event_at[0]) * 1000)))
-                if gap_ms > 0:
-                    append_recorded_step(Step(ACTION_DELAY, delay_ms=gap_ms))
-
-            key_value = key_text.upper() if len(key_text) > 1 else key_text
-            append_recorded_step(Step(ACTION_KEY_DOWN, key=key_value))
-            active[key_id] = (key_value, now)
-            last_event_at[0] = now
-            preview_var.set(f"按住：{key_text}")
-            return "break"
-
-        def on_release(event: tk.Event) -> str:
-            key_id = event_key_id(event)
-            data = active.pop(key_id, None)
-            if data is None:
-                return "break"
-
-            key_text, started_at = data
-            now = time.perf_counter()
-            hold_ms = max(1, int(round((now - started_at) * 1000)))
-            append_recorded_step(Step(ACTION_DELAY, delay_ms=hold_ms))
-            append_recorded_step(Step(ACTION_KEY_UP, key=key_text))
-            last_event_at[0] = now
-            preview_var.set(f"已錄製 {len(recorded)} 個動作")
-            return "break"
-
-        def clear_recording() -> None:
-            recorded.clear()
-            active.clear()
-            last_event_at[0] = None
-            for item in record_tree.get_children():
-                record_tree.delete(item)
-            preview_var.set("已清空錄製內容。")
-            capture_area.focus_force()
-
-        def apply_recording(replace: bool) -> None:
-            current_script = self._selected_script()
-            if current_script is None:
-                return
-            if not recorded:
-                preview_var.set("尚未錄製任何步驟。")
-                capture_area.focus_force()
-                return
-
-            steps = [Step(step.action, step.key, step.delay_ms) for step in recorded]
-            if replace:
-                current_script.steps = steps
-                action = "取代"
-            else:
-                current_script.steps.extend(steps)
-                action = "加入"
-
-            self._save_all()
-            self._refresh_step_tree(current_script)
-            self.status_var.set(f"已{action} {len(steps)} 個錄製步驟。")
-            window.destroy()
-
-        ttk.Button(buttons, text="加入腳本", style="Primary.TButton", command=lambda: apply_recording(False)).grid(
-            row=0, column=0, sticky="ew", padx=(0, 4)
-        )
-        ttk.Button(buttons, text="取代目前步驟", style="Ghost.TButton", command=lambda: apply_recording(True)).grid(
-            row=0, column=1, sticky="ew", padx=4
-        )
-        ttk.Button(buttons, text="清空", style="Danger.TButton", command=clear_recording).grid(
-            row=0, column=2, sticky="ew", padx=4
-        )
-        ttk.Button(buttons, text="關閉", style="Ghost.TButton", command=window.destroy).grid(
-            row=0, column=3, sticky="ew", padx=(4, 0)
-        )
-
-        capture_area.bind("<KeyPress>", on_press)
-        capture_area.bind("<KeyRelease>", on_release)
-        window.bind("<KeyPress>", on_press)
-        window.bind("<KeyRelease>", on_release)
-        self._center_window(window)
-        window.after(100, capture_area.focus_force)
-
     def _center_window(self, window: tk.Toplevel) -> None:
         window.update_idletasks()
         x = self.root.winfo_rootx() + max(0, (self.root.winfo_width() - window.winfo_width()) // 2)
@@ -2041,7 +1893,7 @@ class AutoKeyboardApp:
     def _clone_step(self, step: Step) -> Step:
         return Step(step.action, key=step.key, delay_ms=step.delay_ms)
 
-    def _read_step_form(self) -> list[Step] | None:
+    def _read_step_form(self, *, show_errors: bool = True) -> list[Step] | None:
         form_action = FORM_ACTION_BY_LABEL.get(self.step_action_var.get(), FORM_ACTION_KEY_COMMAND)
         try:
             if form_action == FORM_ACTION_DELAY:
@@ -2056,7 +1908,10 @@ class AutoKeyboardApp:
                 Step(ACTION_KEY_UP, key=key_text),
             ]
         except ValueError as exc:
-            messagebox.showerror(APP_TITLE, str(exc))
+            if show_errors:
+                messagebox.showerror(APP_TITLE, str(exc))
+            else:
+                self.status_var.set(f"步驟尚未自動儲存：{exc}")
             return None
 
     def _add_step(self) -> None:
@@ -2068,31 +1923,48 @@ class AutoKeyboardApp:
         if steps is None:
             return
 
-        start_index = len(script.steps)
-        script.steps.extend(steps)
+        current_index = self._current_step_index()
+        if current_index is None or current_index >= len(script.steps):
+            start_index = len(script.steps)
+        else:
+            start_index = current_index + 1
+        script.steps[start_index:start_index] = steps
         self._save_all()
         self._refresh_step_tree(script)
-        self.step_tree.selection_set(*[str(index) for index in range(start_index, len(script.steps))])
+        end_index = start_index + len(steps)
+        self.step_tree.selection_set(*[str(index) for index in range(start_index, end_index)])
         self.step_tree.focus(str(start_index))
-        self.status_var.set(f"已新增 {len(steps)} 個指令。")
+        self.status_var.set(f"已在第 {start_index + 1} 格新增 {len(steps)} 個指令。")
 
-    def _update_step(self) -> None:
+    def _schedule_auto_save_selected_step(self, *_args) -> None:
+        if self._loading_script or self._loading_step:
+            return
+        if self._auto_save_step_after_id is not None:
+            self.root.after_cancel(self._auto_save_step_after_id)
+        self._auto_save_step_after_id = self.root.after(250, self._auto_save_selected_step)
+
+    def _auto_save_selected_step(self) -> None:
+        self._auto_save_step_after_id = None
         script = self._selected_script()
         index = self._current_step_index()
         if script is None or index is None or index >= len(script.steps):
             return
 
-        steps = self._read_step_form()
+        steps = self._read_step_form(show_errors=False)
         if steps is None:
             return
 
         script.steps[index : index + 1] = steps
         self._save_all()
-        self._refresh_step_tree(script)
-        end_index = index + len(steps)
-        self.step_tree.selection_set(*[str(item) for item in range(index, end_index)])
-        self.step_tree.focus(str(index))
-        self.status_var.set(f"已更新為 {len(steps)} 個指令。")
+        self._loading_step = True
+        try:
+            self._refresh_step_tree(script)
+            end_index = index + len(steps)
+            self.step_tree.selection_set(*[str(item) for item in range(index, end_index)])
+            self.step_tree.focus(str(index))
+        finally:
+            self._loading_step = False
+        self.status_var.set(f"第 {index + 1} 格已自動更新。")
 
     def _delete_step(self) -> None:
         script = self._selected_script()
@@ -2151,21 +2023,27 @@ class AutoKeyboardApp:
         self.status_var.set("已調整步驟順序。")
 
     def _on_step_selected(self, _event: tk.Event | None = None) -> None:
+        if self._loading_step:
+            return
         script = self._selected_script()
         index = self._current_step_index()
         if script is None or index is None or index >= len(script.steps):
             return
 
         step = script.steps[index]
-        if step.action == ACTION_DELAY:
-            self.step_action_var.set(FORM_ACTION_LABELS[FORM_ACTION_DELAY])
-        else:
-            self.step_action_var.set(FORM_ACTION_LABELS[FORM_ACTION_KEY_COMMAND])
-        if step.needs_key():
-            self.step_key_var.set(step.key)
-        if step.action == ACTION_DELAY:
-            self.step_delay_ms_var.set(str(step.delay_ms))
-        self._on_step_action_changed()
+        self._loading_step = True
+        try:
+            if step.action == ACTION_DELAY:
+                self.step_action_var.set(FORM_ACTION_LABELS[FORM_ACTION_DELAY])
+            else:
+                self.step_action_var.set(FORM_ACTION_LABELS[FORM_ACTION_KEY_COMMAND])
+            if step.needs_key():
+                self.step_key_var.set(step.key)
+            if step.action == ACTION_DELAY:
+                self.step_delay_ms_var.set(str(step.delay_ms))
+            self._on_step_action_changed()
+        finally:
+            self._loading_step = False
 
     def _on_step_action_changed(self, _event: tk.Event | None = None) -> None:
         form_action = FORM_ACTION_BY_LABEL.get(self.step_action_var.get(), FORM_ACTION_KEY_COMMAND)
@@ -2180,6 +2058,7 @@ class AutoKeyboardApp:
             self.delay_settings_frame.grid_remove()
             self.key_settings_frame.grid()
             self.status_var.set("按鍵指令會自動新增「按下按鍵」與「放開按鍵」一組指令。")
+        self._schedule_auto_save_selected_step()
 
     def _toggle_selected_script(self) -> None:
         script_id = self._selected_script_id()
@@ -2262,7 +2141,12 @@ class AutoKeyboardApp:
             return
 
         self._closing = True
-        for after_id in (self._poll_after_id, self._auto_save_after_id, self._hotkey_register_after_id):
+        for after_id in (
+            self._poll_after_id,
+            self._auto_save_after_id,
+            self._auto_save_step_after_id,
+            self._hotkey_register_after_id,
+        ):
             if after_id is None:
                 continue
             try:
