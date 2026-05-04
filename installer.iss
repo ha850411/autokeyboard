@@ -12,6 +12,7 @@ Compression=lzma2
 SolidCompression=yes
 PrivilegesRequired=lowest
 UninstallDisplayIcon={app}\AutoKeyboard.exe
+SetupIconFile=assets\AutoKeyboard.ico
 WizardStyle=modern
 
 [Tasks]

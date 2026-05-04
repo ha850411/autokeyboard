@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Iterable
 
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 
 
 APP_TITLE = "AutoKeyboard 腳本精靈"
@@ -29,6 +29,12 @@ def app_directory() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent
+
+
+def resource_path(relative_path: str) -> Path:
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        return Path(sys._MEIPASS) / relative_path
+    return app_directory() / relative_path
 
 
 def user_data_directory() -> Path:
@@ -103,9 +109,9 @@ ACTION_KEY_DOWN = "key_down"
 ACTION_DELAY = "delay"
 ACTION_KEY_UP = "key_up"
 ACTION_LABELS = {
-    ACTION_KEY_DOWN: "按下按鍵",
+    ACTION_KEY_DOWN: "按下按鍵↓",
     ACTION_DELAY: "延遲",
-    ACTION_KEY_UP: "放開按鍵",
+    ACTION_KEY_UP: "放開按鍵↑",
 }
 ACTION_BY_LABEL = {label: action for action, label in ACTION_LABELS.items()}
 
@@ -116,6 +122,15 @@ FORM_ACTION_LABELS = {
     FORM_ACTION_DELAY: "延遲",
 }
 FORM_ACTION_BY_LABEL = {label: action for action, label in FORM_ACTION_LABELS.items()}
+
+KEY_MODE_DOWN = "key_down"
+KEY_MODE_UP = "key_up"
+KEY_MODE_BOTH = "both"
+KEY_MODE_LABELS = {
+    KEY_MODE_BOTH: "按下 + 放開",
+    KEY_MODE_DOWN: "按下",
+    KEY_MODE_UP: "放開",
+}
 
 KEYCODE_TEXT: dict[int, str] = {
     VK_BACK: "BACKSPACE",
@@ -957,7 +972,7 @@ def seconds_to_ms(value: str, field_name: str, minimum_ms: int) -> int:
 
 def text_to_ms(value: str, field_name: str, minimum_ms: int = 0) -> int:
     try:
-        ms = int(round(float(value)))
+        ms = int(round(float(value.replace(",", ""))))
     except ValueError as exc:
         raise ValueError(f"{field_name} 必須是數字。") from exc
 
@@ -968,8 +983,140 @@ def text_to_ms(value: str, field_name: str, minimum_ms: int = 0) -> int:
 
 def format_seconds(ms: int) -> str:
     value = ms / 1000
-    text = f"{value:.3f}".rstrip("0").rstrip(".")
+    return format_number(value)
+
+
+def format_number(value: float) -> str:
+    text = f"{value:,.3f}".rstrip("0").rstrip(".")
     return text or "0"
+
+
+def format_delay_ms(ms: int) -> str:
+    if ms >= 60_000:
+        minutes = ms // 60_000
+        remaining_ms = ms % 60_000
+        if remaining_ms == 0:
+            return f"{minutes:,} 分鐘"
+        return f"{minutes:,} 分鐘 {format_number(remaining_ms / 1000)} 秒"
+    if ms >= 1_000:
+        return f"{format_number(ms / 1000)} 秒"
+    return f"{ms:,} ms"
+
+
+class RoundedEntry(tk.Frame):
+    def __init__(
+        self,
+        master: tk.Widget,
+        textvariable: tk.StringVar,
+        width: int | None = None,
+        colors: dict[str, str] | None = None,
+    ) -> None:
+        self.colors = colors or {}
+        self.bg_color = self.colors.get("surface", "#ffffff")
+        super().__init__(master, bg=self.bg_color, highlightthickness=0, bd=0)
+
+        self.radius = 9
+        self.border_color = self.colors.get("input_border", "#cbd5e1")
+        self.focus_color = self.colors.get("primary", "#2563eb")
+        self.fill_color = "#ffffff"
+        self.disabled_fill = self.colors.get("surface_alt", "#f1f5f9")
+        self.disabled_text = self.colors.get("muted", "#64748b")
+        self.text_color = self.colors.get("text", "#0f172a")
+        self._focused = False
+        self._state = "normal"
+
+        self.canvas = tk.Canvas(self, height=40, bg=self.bg_color, highlightthickness=0, bd=0)
+        self.canvas.pack(fill="both", expand=True)
+        self.entry = tk.Entry(
+            self.canvas,
+            textvariable=textvariable,
+            width=width or 20,
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+            bg=self.fill_color,
+            fg=self.text_color,
+            insertbackground=self.text_color,
+            disabledbackground=self.disabled_fill,
+            disabledforeground=self.disabled_text,
+            font=("Microsoft JhengHei UI", 10),
+        )
+        self.entry_window = self.canvas.create_window(14, 20, anchor="w", window=self.entry)
+        self.canvas.bind("<Configure>", self._redraw)
+        self.entry.bind("<FocusIn>", self._on_focus_in, add="+")
+        self.entry.bind("<FocusOut>", self._on_focus_out, add="+")
+
+    def _rounded_rect(self, x1: int, y1: int, x2: int, y2: int, radius: int, **kwargs) -> int:
+        points = [
+            x1 + radius,
+            y1,
+            x2 - radius,
+            y1,
+            x2,
+            y1,
+            x2,
+            y1 + radius,
+            x2,
+            y2 - radius,
+            x2,
+            y2,
+            x2 - radius,
+            y2,
+            x1 + radius,
+            y2,
+            x1,
+            y2,
+            x1,
+            y2 - radius,
+            x1,
+            y1 + radius,
+            x1,
+            y1,
+        ]
+        return self.canvas.create_polygon(points, smooth=True, **kwargs)
+
+    def _redraw(self, _event: tk.Event | None = None) -> None:
+        width = max(self.canvas.winfo_width(), 80)
+        height = max(self.canvas.winfo_height(), 40)
+        self.canvas.delete("bg")
+        border = self.focus_color if self._focused else self.border_color
+        fill = self.disabled_fill if self._state == "disabled" else self.fill_color
+        self._rounded_rect(1, 1, width - 1, height - 1, self.radius, fill=fill, outline=border, width=1, tags="bg")
+        self.canvas.tag_lower("bg")
+        self.canvas.coords(self.entry_window, 14, height // 2)
+        self.canvas.itemconfigure(self.entry_window, width=max(width - 28, 40), height=max(height - 14, 24))
+        self.entry.configure(bg=fill)
+
+    def _on_focus_in(self, _event: tk.Event) -> None:
+        self._focused = True
+        self._redraw()
+
+    def _on_focus_out(self, _event: tk.Event) -> None:
+        self._focused = False
+        self._redraw()
+
+    def bind(self, sequence: str | None = None, func=None, add: str | None = None):  # type: ignore[override]
+        return self.entry.bind(sequence, func, add)
+
+    def configure(self, cnf=None, **kwargs):  # type: ignore[override]
+        if cnf:
+            kwargs.update(cnf)
+        state = kwargs.pop("state", None)
+        if state is not None:
+            self._state = str(state)
+            self.entry.configure(state=state)
+            self._redraw()
+        if kwargs:
+            return super().configure(**kwargs)
+        return None
+
+    config = configure
+
+    def focus_set(self) -> None:
+        self.entry.focus_set()
+
+    def selection_range(self, start: int, end: int | str) -> None:
+        self.entry.selection_range(start, end)
 
 
 class AutoKeyboardApp:
@@ -978,6 +1125,7 @@ class AutoKeyboardApp:
         self.root.title(APP_TITLE)
         self.root.geometry("1120x720")
         self.root.minsize(980, 620)
+        self._set_window_icon()
 
         self.scripts = load_scripts()
         self.keyboard = WindowsKeyboard()
@@ -993,14 +1141,24 @@ class AutoKeyboardApp:
         self._auto_save_step_after_id: str | None = None
         self._hotkey_register_after_id: str | None = None
         self._poll_after_id: str | None = None
+        self._step_drag_start_y: int | None = None
+        self._step_drag_indices: list[int] = []
+        self._step_dragging = False
+        self._step_drag_insert_index: int | None = None
+        self._step_drag_pulse_after_id: str | None = None
+        self._step_drag_pulse_on = False
+        self._step_drag_start_row: str | None = None
+        self._step_drag_started_on_selection = False
+        self._step_clipboard: list[Step] = []
 
         self.name_var = tk.StringVar()
         self.hotkey_var = tk.StringVar()
         self.hotkey_hint_var = tk.StringVar(value="按「錄製」設定腳本快捷鍵")
         self.repeat_var = tk.BooleanVar(value=True)
         self.step_action_var = tk.StringVar(value=FORM_ACTION_LABELS[FORM_ACTION_KEY_COMMAND])
+        self.step_key_mode_var = tk.StringVar(value=KEY_MODE_BOTH)
         self.step_key_var = tk.StringVar(value="SPACE")
-        self.step_delay_ms_var = tk.StringVar(value="1000")
+        self.step_delay_ms_var = tk.StringVar(value="1,000")
         self.banner_var = tk.StringVar(value="待命")
         self.status_var = tk.StringVar(value="準備就緒")
 
@@ -1013,14 +1171,24 @@ class AutoKeyboardApp:
         self._poll_events()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
+    def _set_window_icon(self) -> None:
+        icon_path = resource_path("assets/AutoKeyboard.ico")
+        if not icon_path.exists():
+            return
+        try:
+            self.root.iconbitmap(str(icon_path))
+        except tk.TclError:
+            pass
+
     def _configure_style(self) -> None:
         style = ttk.Style()
         self.colors = {
-            "bg": "#f5f7fb",
+            "bg": "#f8fafc",
             "surface": "#ffffff",
-            "surface_alt": "#eef2f7",
-            "line": "#d9e2ec",
-            "text": "#172033",
+            "surface_alt": "#f1f5f9",
+            "line": "#e2e8f0",
+            "input_border": "#cbd5e1",
+            "text": "#0f172a",
             "muted": "#64748b",
             "primary": "#2563eb",
             "primary_hover": "#1d4ed8",
@@ -1047,7 +1215,7 @@ class AutoKeyboardApp:
 
         style.configure(".", background=colors["bg"], foreground=colors["text"], font=base_font)
         style.configure("TFrame", background=colors["bg"])
-        style.configure("Panel.TFrame", background=colors["surface"], relief="solid", borderwidth=1)
+        style.configure("Panel.TFrame", background=colors["surface"], relief="flat", borderwidth=0)
         style.configure("Header.TFrame", background=colors["surface"])
         style.configure("Toolbar.TFrame", background=colors["surface"])
         style.configure("TPanedwindow", background=colors["bg"])
@@ -1073,7 +1241,7 @@ class AutoKeyboardApp:
         )
         style.configure(
             "Status.TLabel",
-            background=colors["surface"],
+            background=colors["bg"],
             foreground=colors["muted"],
             padding=(16, 9),
         )
@@ -1095,19 +1263,19 @@ class AutoKeyboardApp:
             background=[("active", "#e2e8f0"), ("pressed", "#cbd5e1")],
             foreground=[("disabled", "#94a3b8")],
         )
-        style.configure("Primary.TButton", background=colors["primary"], foreground="#ffffff")
+        style.configure("Primary.TButton", background=colors["primary"], foreground="#ffffff", padding=(14, 8))
         style.map(
             "Primary.TButton",
             background=[("active", colors["primary_hover"]), ("pressed", colors["primary_hover"])],
             foreground=[("disabled", "#dbeafe")],
         )
-        style.configure("Danger.TButton", background="#fee2e2", foreground=colors["danger"])
+        style.configure("Danger.TButton", background="#fee2e2", foreground=colors["danger"], padding=(14, 8))
         style.map(
             "Danger.TButton",
             background=[("active", "#fecaca"), ("pressed", "#fecaca")],
             foreground=[("active", colors["danger_hover"])],
         )
-        style.configure("Ghost.TButton", background=colors["surface_alt"], foreground=colors["text"])
+        style.configure("Ghost.TButton", background=colors["surface_alt"], foreground=colors["text"], padding=(14, 8))
         style.map("Ghost.TButton", background=[("active", "#e2e8f0"), ("pressed", "#cbd5e1")])
 
         style.configure(
@@ -1136,6 +1304,14 @@ class AutoKeyboardApp:
         style.map("TCheckbutton", background=[("active", colors["surface"])])
         style.configure("TRadiobutton", background=colors["surface"], foreground=colors["text"])
         style.map("TRadiobutton", background=[("active", colors["surface"])])
+        style.configure(
+            "Large.TRadiobutton",
+            background=colors["surface"],
+            foreground=colors["text"],
+            padding=(14, 10),
+            font=("Microsoft JhengHei UI", 12),
+        )
+        style.map("Large.TRadiobutton", background=[("active", colors["surface"])])
 
     def _build_ui(self) -> None:
         self.root.columnconfigure(0, weight=1)
@@ -1181,7 +1357,7 @@ class AutoKeyboardApp:
 
         script_buttons = ttk.Frame(left, style="Toolbar.TFrame")
         script_buttons.grid(row=2, column=0, sticky="ew", pady=(12, 0))
-        for column in range(4):
+        for column in range(3):
             script_buttons.columnconfigure(column, weight=1)
 
         ttk.Button(script_buttons, text="新增", style="Primary.TButton", command=self._add_script).grid(
@@ -1191,7 +1367,13 @@ class AutoKeyboardApp:
             row=0, column=1, sticky="ew", padx=4
         )
         ttk.Button(script_buttons, text="刪除", style="Danger.TButton", command=self._delete_script).grid(
-            row=0, column=2, sticky="ew", padx=4
+            row=0, column=2, sticky="ew", padx=(4, 0)
+        )
+        ttk.Button(script_buttons, text="匯入", style="Ghost.TButton", command=self._import_scripts).grid(
+            row=1, column=0, sticky="ew", padx=(0, 4), pady=(8, 0)
+        )
+        ttk.Button(script_buttons, text="匯出", style="Ghost.TButton", command=self._export_scripts).grid(
+            row=1, column=1, sticky="ew", padx=4, pady=(8, 0)
         )
         self.toggle_button = ttk.Button(
             script_buttons,
@@ -1199,7 +1381,7 @@ class AutoKeyboardApp:
             style="Primary.TButton",
             command=self._toggle_selected_script,
         )
-        self.toggle_button.grid(row=0, column=3, sticky="ew", padx=(4, 0))
+        self.toggle_button.grid(row=1, column=2, sticky="ew", padx=(4, 0), pady=(8, 0))
 
         right.columnconfigure(0, weight=1)
         right.rowconfigure(3, weight=1)
@@ -1211,7 +1393,7 @@ class AutoKeyboardApp:
         ttk.Label(editor, text="腳本名稱", style="Panel.TLabel").grid(
             row=0, column=0, sticky="w", padx=(0, 10), pady=(0, 10)
         )
-        self.name_entry = ttk.Entry(editor, textvariable=self.name_var)
+        self.name_entry = RoundedEntry(editor, textvariable=self.name_var, colors=self.colors)
         self.name_entry.grid(row=0, column=1, sticky="ew", pady=(0, 8))
 
         ttk.Label(editor, text="快捷鍵", style="Panel.TLabel").grid(
@@ -1220,7 +1402,7 @@ class AutoKeyboardApp:
         hotkey_row = ttk.Frame(editor, style="Panel.TFrame")
         hotkey_row.grid(row=1, column=1, sticky="ew", pady=(0, 8))
         hotkey_row.columnconfigure(0, weight=1)
-        self.hotkey_entry = ttk.Entry(hotkey_row, textvariable=self.hotkey_var)
+        self.hotkey_entry = RoundedEntry(hotkey_row, textvariable=self.hotkey_var, colors=self.colors)
         self.hotkey_entry.grid(row=0, column=0, sticky="ew", padx=(0, 8))
         self.hotkey_entry.bind("<KeyPress>", self._capture_hotkey_from_entry)
         self.hotkey_entry.bind("<FocusOut>", self._cancel_hotkey_recording)
@@ -1243,13 +1425,25 @@ class AutoKeyboardApp:
         self.step_tree = ttk.Treeview(right, columns=("action", "key", "delay"), show="headings", selectmode="extended")
         self.step_tree.heading("action", text="動作")
         self.step_tree.heading("key", text="按鍵")
-        self.step_tree.heading("delay", text="延遲 ms")
+        self.step_tree.heading("delay", text="延遲")
         self.step_tree.column("action", width=120, minwidth=100)
         self.step_tree.column("key", width=160, minwidth=120)
         self.step_tree.column("delay", width=110, minwidth=90, anchor="center")
+        self.step_tree.tag_configure("step_odd", background="#ffffff")
+        self.step_tree.tag_configure("step_even", background="#f8fafc")
+        self.step_tree.tag_configure("step_dragging", background="#bfdbfe")
+        self.step_tree.tag_configure("step_drop_before", background="#fde68a")
+        self.step_tree.tag_configure("step_drop_after", background="#fde68a")
         self.step_tree.grid(row=3, column=0, sticky="nsew")
         self.step_tree.bind("<<TreeviewSelect>>", self._on_step_selected)
         self.step_tree.bind("<Delete>", self._delete_selected_steps_event)
+        self.step_tree.bind("<Control-c>", self._copy_selected_steps_event)
+        self.step_tree.bind("<Control-C>", self._copy_selected_steps_event)
+        self.step_tree.bind("<Control-v>", self._paste_steps_event)
+        self.step_tree.bind("<Control-V>", self._paste_steps_event)
+        self.step_tree.bind("<ButtonPress-1>", self._on_step_drag_start)
+        self.step_tree.bind("<B1-Motion>", self._on_step_drag_motion)
+        self.step_tree.bind("<ButtonRelease-1>", self._on_step_drag_release)
 
         step_form = ttk.Frame(right, style="Panel.TFrame")
         step_form.grid(row=4, column=0, sticky="ew", pady=(12, 0))
@@ -1264,6 +1458,7 @@ class AutoKeyboardApp:
             value=FORM_ACTION_LABELS[FORM_ACTION_KEY_COMMAND],
             variable=self.step_action_var,
             command=self._on_step_action_changed,
+            style="Large.TRadiobutton",
         ).grid(row=0, column=0, sticky="w", padx=(0, 14))
         ttk.Radiobutton(
             action_options,
@@ -1271,25 +1466,44 @@ class AutoKeyboardApp:
             value=FORM_ACTION_LABELS[FORM_ACTION_DELAY],
             variable=self.step_action_var,
             command=self._on_step_action_changed,
+            style="Large.TRadiobutton",
         ).grid(row=0, column=1, sticky="w")
 
         self.key_settings_frame = ttk.Frame(step_form, style="Panel.TFrame")
         self.key_settings_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
         self.key_settings_frame.columnconfigure(1, weight=1)
-        ttk.Label(self.key_settings_frame, text="按鍵", style="Panel.TLabel").grid(
+        ttk.Label(self.key_settings_frame, text="按鍵動作", style="Panel.TLabel").grid(
             row=0, column=0, sticky="w", padx=(0, 6)
         )
-        self.step_key_entry = ttk.Entry(self.key_settings_frame, textvariable=self.step_key_var, width=18)
-        self.step_key_entry.grid(row=0, column=1, sticky="ew", padx=(0, 6))
+        key_mode_options = ttk.Frame(self.key_settings_frame, style="Panel.TFrame")
+        key_mode_options.grid(row=0, column=1, columnspan=2, sticky="w", padx=(0, 6))
+        for column, mode in enumerate((KEY_MODE_DOWN, KEY_MODE_UP, KEY_MODE_BOTH)):
+            ttk.Radiobutton(
+                key_mode_options,
+                text=KEY_MODE_LABELS[mode],
+                value=mode,
+                variable=self.step_key_mode_var,
+                style="Large.TRadiobutton",
+            ).grid(row=0, column=column, sticky="w", padx=(0, 12))
+        ttk.Label(self.key_settings_frame, text="按鍵", style="Panel.TLabel").grid(
+            row=1, column=0, sticky="w", padx=(0, 6), pady=(8, 0)
+        )
+        self.step_key_entry = RoundedEntry(
+            self.key_settings_frame,
+            textvariable=self.step_key_var,
+            width=18,
+            colors=self.colors,
+        )
+        self.step_key_entry.grid(row=1, column=1, sticky="ew", padx=(0, 6), pady=(8, 0))
         self.step_key_entry.bind("<KeyPress>", self._capture_step_key_from_entry)
         ttk.Button(self.key_settings_frame, text="錄製", style="Ghost.TButton", command=self._capture_step_key).grid(
-            row=0, column=2, sticky="ew"
+            row=1, column=2, sticky="ew", pady=(8, 0)
         )
         ttk.Label(
             self.key_settings_frame,
             text="可輸入單鍵、組合鍵，或用逗號同時按多鍵，例如 X, SPACE。",
             style="Small.TLabel",
-        ).grid(row=1, column=1, columnspan=2, sticky="w", pady=(6, 0))
+        ).grid(row=2, column=1, columnspan=2, sticky="w", pady=(6, 0))
 
         self.delay_settings_frame = ttk.Frame(step_form, style="Panel.TFrame")
         self.delay_settings_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
@@ -1297,7 +1511,13 @@ class AutoKeyboardApp:
         ttk.Label(self.delay_settings_frame, text="延遲 ms", style="Panel.TLabel").grid(
             row=0, column=0, sticky="w", padx=(0, 6)
         )
-        ttk.Entry(self.delay_settings_frame, textvariable=self.step_delay_ms_var, width=12).grid(
+        self.step_delay_entry = RoundedEntry(
+            self.delay_settings_frame,
+            textvariable=self.step_delay_ms_var,
+            width=12,
+            colors=self.colors,
+        )
+        self.step_delay_entry.grid(
             row=0, column=1, sticky="ew"
         )
         ttk.Label(
@@ -1381,6 +1601,7 @@ class AutoKeyboardApp:
         self._update_toggle_button()
 
     def _refresh_step_tree(self, script: Script | None = None) -> None:
+        self._stop_step_drag_pulse()
         for item in self.step_tree.get_children():
             self.step_tree.delete(item)
 
@@ -1390,13 +1611,17 @@ class AutoKeyboardApp:
 
         for index, step in enumerate(script.steps):
             key = step.key if step.needs_key() else ""
-            delay = str(step.delay_ms) if step.action == ACTION_DELAY else ""
+            delay = format_delay_ms(step.delay_ms) if step.action == ACTION_DELAY else ""
             self.step_tree.insert(
                 "",
                 "end",
                 iid=str(index),
                 values=(step.display_action(), key, delay),
+                tags=self._step_base_tags(index),
             )
+
+    def _step_base_tags(self, index: int) -> tuple[str, ...]:
+        return ("step_odd",) if index % 2 == 0 else ("step_even",)
 
     def _status_for(self, script_id: str) -> str:
         if script_id in self.runners:
@@ -1509,6 +1734,104 @@ class AutoKeyboardApp:
         self._select_first_script()
         self.status_var.set("已刪除腳本。")
 
+    def _export_scripts(self) -> None:
+        if not self.scripts:
+            messagebox.showwarning(APP_TITLE, "沒有可匯出的腳本。")
+            return
+
+        path = filedialog.asksaveasfilename(
+            parent=self.root,
+            title="匯出腳本",
+            defaultextension=".json",
+            initialfile="autokeyboard_scripts.json",
+            filetypes=(("JSON files", "*.json"), ("All files", "*.*")),
+        )
+        if not path:
+            return
+
+        data = {
+            "app": APP_NAME,
+            "format": "autokeyboard.scripts",
+            "version": 1,
+            "exported_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "scripts": [script.to_dict() for script in self.scripts],
+        }
+        try:
+            Path(path).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError as exc:
+            messagebox.showerror(APP_TITLE, f"匯出失敗：\n{exc}")
+            return
+
+        self.status_var.set(f"已匯出 {len(self.scripts)} 個腳本。")
+
+    def _import_scripts(self) -> None:
+        path = filedialog.askopenfilename(
+            parent=self.root,
+            title="匯入腳本",
+            filetypes=(("JSON files", "*.json"), ("All files", "*.*")),
+        )
+        if not path:
+            return
+
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+            imported_scripts = self._scripts_from_import_data(data)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            messagebox.showerror(APP_TITLE, f"匯入失敗：\n{exc}")
+            return
+
+        if not imported_scripts:
+            messagebox.showwarning(APP_TITLE, "檔案中沒有可匯入的腳本。")
+            return
+
+        used_names = {script.name for script in self.scripts}
+        for script in imported_scripts:
+            script.id = str(uuid.uuid4())
+            script.hotkey = ""
+            script.name = self._unique_imported_script_name(script.name, used_names)
+            used_names.add(script.name)
+
+        self.scripts.extend(imported_scripts)
+        self._save_all()
+        self._refresh_script_tree()
+        first_imported = imported_scripts[0]
+        self.script_tree.selection_set(first_imported.id)
+        self.script_tree.focus(first_imported.id)
+        self._load_script_into_editor(first_imported)
+        self.status_var.set(f"已匯入 {len(imported_scripts)} 個腳本，快捷鍵已清空以避免衝突。")
+
+    def _scripts_from_import_data(self, data) -> list[Script]:
+        if isinstance(data, list):
+            raw_scripts = data
+        elif isinstance(data, dict) and isinstance(data.get("scripts"), list):
+            raw_scripts = data["scripts"]
+        elif isinstance(data, dict) and isinstance(data.get("script"), dict):
+            raw_scripts = [data["script"]]
+        elif isinstance(data, dict) and "steps" in data:
+            raw_scripts = [data]
+        else:
+            raise ValueError("檔案格式不正確，找不到 scripts。")
+
+        scripts: list[Script] = []
+        for index, item in enumerate(raw_scripts, start=1):
+            if not isinstance(item, dict):
+                raise ValueError(f"第 {index} 個腳本格式不正確。")
+            scripts.append(Script.from_dict(item))
+        return scripts
+
+    def _unique_imported_script_name(self, name: str, existing_names: set[str]) -> str:
+        if name not in existing_names:
+            return name
+
+        base = f"{name} 匯入"
+        if base not in existing_names:
+            return base
+
+        counter = 2
+        while f"{base} {counter}" in existing_names:
+            counter += 1
+        return f"{base} {counter}"
+
     def _save_current_script(self) -> None:
         script = self._selected_script()
         if script is None:
@@ -1541,7 +1864,7 @@ class AutoKeyboardApp:
     def _bind_auto_save(self) -> None:
         for variable in (self.name_var, self.hotkey_var, self.repeat_var):
             variable.trace_add("write", self._schedule_auto_save_script_settings)
-        for variable in (self.step_action_var, self.step_key_var, self.step_delay_ms_var):
+        for variable in (self.step_key_mode_var, self.step_key_var, self.step_delay_ms_var):
             variable.trace_add("write", self._schedule_auto_save_selected_step)
 
     def _schedule_auto_save_script_settings(self, *_args) -> None:
@@ -1893,9 +2216,30 @@ class AutoKeyboardApp:
     def _clone_step(self, step: Step) -> Step:
         return Step(step.action, key=step.key, delay_ms=step.delay_ms)
 
-    def _read_step_form(self, *, show_errors: bool = True) -> list[Step] | None:
+    def _steps_for_key_mode(self, key: str) -> list[Step]:
+        mode = self.step_key_mode_var.get()
+        if mode == KEY_MODE_DOWN:
+            return [Step(ACTION_KEY_DOWN, key=key)]
+        if mode == KEY_MODE_UP:
+            return [Step(ACTION_KEY_UP, key=key)]
+        return [
+            Step(ACTION_KEY_DOWN, key=key),
+            Step(ACTION_KEY_UP, key=key),
+        ]
+
+    def _read_step_form(self, *, show_errors: bool = True, existing_step: Step | None = None) -> list[Step] | None:
         form_action = FORM_ACTION_BY_LABEL.get(self.step_action_var.get(), FORM_ACTION_KEY_COMMAND)
         try:
+            if existing_step is not None:
+                if existing_step.action == ACTION_DELAY:
+                    delay_ms = text_to_ms(self.step_delay_ms_var.get().strip(), "撱園 ms", 0)
+                    return [Step(ACTION_DELAY, delay_ms=delay_ms)]
+
+                key = self.step_key_var.get().strip()
+                KeyResolver.resolve_key_actions(key)
+                key_text = key.upper() if len(key) > 1 else key
+                return self._steps_for_key_mode(key_text)
+
             if form_action == FORM_ACTION_DELAY:
                 delay_ms = text_to_ms(self.step_delay_ms_var.get().strip(), "延遲 ms", 0)
                 return [Step(ACTION_DELAY, delay_ms=delay_ms)]
@@ -1903,10 +2247,7 @@ class AutoKeyboardApp:
             key = self.step_key_var.get().strip()
             KeyResolver.resolve_key_actions(key)
             key_text = key.upper() if len(key) > 1 else key
-            return [
-                Step(ACTION_KEY_DOWN, key=key_text),
-                Step(ACTION_KEY_UP, key=key_text),
-            ]
+            return self._steps_for_key_mode(key_text)
         except ValueError as exc:
             if show_errors:
                 messagebox.showerror(APP_TITLE, str(exc))
@@ -1939,9 +2280,26 @@ class AutoKeyboardApp:
     def _schedule_auto_save_selected_step(self, *_args) -> None:
         if self._loading_script or self._loading_step:
             return
+        if not self._selected_step_matches_step_form():
+            if self._auto_save_step_after_id is not None:
+                self.root.after_cancel(self._auto_save_step_after_id)
+                self._auto_save_step_after_id = None
+            return
         if self._auto_save_step_after_id is not None:
             self.root.after_cancel(self._auto_save_step_after_id)
         self._auto_save_step_after_id = self.root.after(250, self._auto_save_selected_step)
+
+    def _selected_step_matches_step_form(self) -> bool:
+        script = self._selected_script()
+        index = self._current_step_index()
+        if script is None or index is None or index >= len(script.steps):
+            return False
+
+        form_action = FORM_ACTION_BY_LABEL.get(self.step_action_var.get(), FORM_ACTION_KEY_COMMAND)
+        selected_step = script.steps[index]
+        if form_action == FORM_ACTION_DELAY:
+            return selected_step.action == ACTION_DELAY
+        return selected_step.needs_key()
 
     def _auto_save_selected_step(self) -> None:
         self._auto_save_step_after_id = None
@@ -1949,8 +2307,10 @@ class AutoKeyboardApp:
         index = self._current_step_index()
         if script is None or index is None or index >= len(script.steps):
             return
+        if not self._selected_step_matches_step_form():
+            return
 
-        steps = self._read_step_form(show_errors=False)
+        steps = self._read_step_form(show_errors=False, existing_step=script.steps[index])
         if steps is None:
             return
 
@@ -1986,6 +2346,268 @@ class AutoKeyboardApp:
     def _delete_selected_steps_event(self, _event: tk.Event | None = None) -> str:
         self._delete_step()
         return "break"
+
+    def _copy_selected_steps_event(self, _event: tk.Event | None = None) -> str:
+        self._copy_selected_steps_to_clipboard()
+        return "break"
+
+    def _paste_steps_event(self, _event: tk.Event | None = None) -> str:
+        self._paste_steps_from_clipboard()
+        return "break"
+
+    def _copy_selected_steps_to_clipboard(self) -> None:
+        script = self._selected_script()
+        indices = self._selected_step_indices()
+        if script is None or not indices:
+            self.status_var.set("請先選取要複製的步驟。")
+            return
+
+        self._step_clipboard = [
+            self._clone_step(script.steps[index])
+            for index in indices
+            if 0 <= index < len(script.steps)
+        ]
+        self.status_var.set(f"已複製 {len(self._step_clipboard)} 個步驟，可用 Ctrl+V 貼上。")
+
+    def _paste_steps_from_clipboard(self) -> None:
+        script = self._selected_script()
+        if script is None:
+            return
+        if not self._step_clipboard:
+            self.status_var.set("剪貼簿沒有步驟可貼上。")
+            return
+
+        indices = self._selected_step_indices()
+        if indices:
+            insert_at = min(max(indices) + 1, len(script.steps))
+        else:
+            insert_at = len(script.steps)
+
+        pasted = [self._clone_step(step) for step in self._step_clipboard]
+        script.steps[insert_at:insert_at] = pasted
+        self._save_all()
+        self._refresh_step_tree(script)
+        new_indices = [str(index) for index in range(insert_at, insert_at + len(pasted))]
+        self.step_tree.selection_set(*new_indices)
+        self.step_tree.focus(str(insert_at))
+        self.status_var.set(f"已貼上 {len(pasted)} 個步驟。")
+
+    def _reset_step_drag_state(self) -> None:
+        self._step_drag_start_y = None
+        self._step_drag_indices = []
+        self._step_dragging = False
+        self._step_drag_insert_index = None
+        self._step_drag_start_row = None
+        self._step_drag_started_on_selection = False
+        self._clear_step_drag_preview()
+
+    def _clear_step_drag_preview(self) -> None:
+        self._stop_step_drag_pulse()
+        self._retag_step_tree_display_order()
+
+    def _apply_step_drag_preview(self, insert_index: int) -> None:
+        self._step_drag_insert_index = insert_index
+        current_order = list(self.step_tree.get_children())
+        dragged_items = [str(index) for index in self._step_drag_indices]
+        dragged = {str(index) for index in self._step_drag_indices}
+
+        adjusted_index = insert_index - sum(1 for item in current_order[:insert_index] if item in dragged)
+        remaining_items = [item for item in current_order if item not in dragged]
+        adjusted_index = max(0, min(adjusted_index, len(remaining_items)))
+        preview_order = remaining_items[:adjusted_index] + dragged_items + remaining_items[adjusted_index:]
+
+        for position, item in enumerate(preview_order):
+            self.step_tree.move(item, "", position)
+        self.step_tree.selection_set(*dragged_items)
+        self._retag_step_tree_display_order(dragged)
+
+    def _retag_step_tree_display_order(self, dragging: set[str] | None = None) -> None:
+        dragging = dragging or set()
+        for position, item in enumerate(self.step_tree.get_children()):
+            tags = list(self._step_base_tags(position))
+            if item in dragging:
+                tags.append("step_dragging")
+            self.step_tree.item(item, tags=tuple(tags))
+
+    def _start_step_drag_pulse(self) -> None:
+        if self._step_drag_pulse_after_id is not None:
+            return
+        self._pulse_step_drop_marker()
+
+    def _pulse_step_drop_marker(self) -> None:
+        if not self._step_dragging:
+            self._step_drag_pulse_after_id = None
+            return
+
+        color = "#fbbf24" if self._step_drag_pulse_on else "#fde68a"
+        self.step_tree.tag_configure("step_drop_before", background=color)
+        self.step_tree.tag_configure("step_drop_after", background=color)
+        self._step_drag_pulse_on = not self._step_drag_pulse_on
+        self._step_drag_pulse_after_id = self.root.after(140, self._pulse_step_drop_marker)
+
+    def _stop_step_drag_pulse(self) -> None:
+        if self._step_drag_pulse_after_id is not None:
+            try:
+                self.root.after_cancel(self._step_drag_pulse_after_id)
+            except tk.TclError:
+                pass
+            self._step_drag_pulse_after_id = None
+        self._step_drag_pulse_on = False
+        if hasattr(self, "step_tree"):
+            self.step_tree.tag_configure("step_drop_before", background="#fde68a")
+            self.step_tree.tag_configure("step_drop_after", background="#fde68a")
+
+    def _event_has_selection_modifier(self, event: tk.Event) -> bool:
+        try:
+            state = int(getattr(event, "state", 0) or 0)
+        except (TypeError, ValueError):
+            return False
+        return bool(state & 0x0001 or state & 0x0004)
+
+    def _on_step_drag_start(self, event: tk.Event) -> str | None:
+        row = self.step_tree.identify_row(event.y)
+        if not row:
+            self._reset_step_drag_state()
+            return None
+
+        self._step_drag_start_y = event.y
+        self._step_drag_start_row = row
+        self._step_drag_started_on_selection = row in self.step_tree.selection() and not self._event_has_selection_modifier(event)
+        self._step_drag_indices = []
+        self._step_dragging = False
+        self._step_drag_insert_index = None
+        if self._step_drag_started_on_selection:
+            self.step_tree.focus(row)
+            return "break"
+        return None
+
+    def _on_step_drag_motion(self, event: tk.Event) -> str | None:
+        if self._step_drag_start_y is None or self._step_drag_start_row is None:
+            return None
+        if not self._step_dragging and abs(event.y - self._step_drag_start_y) < 6:
+            return None
+        if self.step_tree.identify_region(event.x, event.y) == "heading":
+            return None
+        if not self._step_drag_started_on_selection:
+            return None
+
+        if not self._step_drag_indices:
+            selection = self.step_tree.selection()
+            if self._step_drag_start_row not in selection:
+                return None
+            self._step_drag_indices = self._selected_step_indices()
+            if not self._step_drag_indices:
+                return None
+
+        self._step_dragging = True
+        insert_index = self._step_drop_index(event.y)
+        self._apply_step_drag_preview(insert_index)
+        if event.y < 0:
+            self.step_tree.yview_scroll(-1, "units")
+        elif event.y > self.step_tree.winfo_height():
+            self.step_tree.yview_scroll(1, "units")
+        self.status_var.set(f"Move {len(self._step_drag_indices)} actions to position {insert_index + 1}")
+        return "break"
+
+    def _on_step_drag_release(self, event: tk.Event) -> str | None:
+        if not self._step_dragging or not self._step_drag_indices:
+            clicked_row = self._step_drag_start_row
+            should_single_select = self._step_drag_started_on_selection and clicked_row is not None
+            self._reset_step_drag_state()
+            if should_single_select:
+                self.step_tree.selection_set(clicked_row)
+                self.step_tree.focus(clicked_row)
+                return "break"
+            return None
+
+        script = self._selected_script()
+        indices = [index for index in self._step_drag_indices if script is not None and 0 <= index < len(script.steps)]
+        preview_order = list(self.step_tree.get_children())
+        self._reset_step_drag_state()
+        if script is None or not indices:
+            return "break"
+
+        self._apply_step_preview_order(script, preview_order, indices)
+        return "break"
+
+    def _step_drop_index(self, y: int) -> int:
+        script = self._selected_script()
+        step_count = len(script.steps) if script is not None else 0
+        children = list(self.step_tree.get_children())
+        row = self.step_tree.identify_row(y)
+        if not row:
+            return step_count if y > self.step_tree.winfo_height() // 2 else 0
+
+        try:
+            row_index = children.index(row)
+        except ValueError:
+            return step_count
+
+        bbox = self.step_tree.bbox(row)
+        if bbox and y > bbox[1] + (bbox[3] // 2):
+            row_index += 1
+        return max(0, min(row_index, step_count))
+
+    def _apply_step_preview_order(self, script: Script, item_order: list[str], moved_indices: list[int]) -> None:
+        old_steps = script.steps
+        ordered_indices: list[int] = []
+        for item in item_order:
+            try:
+                index = int(item)
+            except ValueError:
+                continue
+            if 0 <= index < len(old_steps):
+                ordered_indices.append(index)
+
+        if len(ordered_indices) != len(old_steps):
+            self._refresh_step_tree(script)
+            return
+
+        new_steps = [old_steps[index] for index in ordered_indices]
+        if new_steps == old_steps:
+            self._refresh_step_tree(script)
+            return
+
+        moved = set(moved_indices)
+        selected_positions = [position for position, index in enumerate(ordered_indices) if index in moved]
+        script.steps = new_steps
+        self._save_all()
+        self._loading_step = True
+        try:
+            self._refresh_step_tree(script)
+            if selected_positions:
+                selection = [str(position) for position in selected_positions]
+                self.step_tree.selection_set(*selection)
+                self.step_tree.focus(selection[0])
+        finally:
+            self._loading_step = False
+        self.status_var.set(f"Moved {len(selected_positions)} actions.")
+
+    def _move_steps_to_index(self, script: Script, indices: list[int], insert_index: int) -> None:
+        indices = sorted(set(index for index in indices if 0 <= index < len(script.steps)))
+        if not indices:
+            return
+
+        moved_steps = [script.steps[index] for index in indices]
+        remaining_steps = [step for index, step in enumerate(script.steps) if index not in indices]
+        adjusted_index = insert_index - sum(1 for index in indices if index < insert_index)
+        adjusted_index = max(0, min(adjusted_index, len(remaining_steps)))
+
+        new_steps = remaining_steps[:adjusted_index] + moved_steps + remaining_steps[adjusted_index:]
+        if new_steps == script.steps:
+            return
+
+        script.steps = new_steps
+        self._save_all()
+        self._loading_step = True
+        try:
+            self._refresh_step_tree(script)
+            new_indices = [str(index) for index in range(adjusted_index, adjusted_index + len(moved_steps))]
+            self.step_tree.selection_set(*new_indices)
+            self.step_tree.focus(str(adjusted_index))
+        finally:
+            self._loading_step = False
+        self.status_var.set(f"Moved {len(moved_steps)} actions.")
 
     def _copy_steps(self) -> None:
         script = self._selected_script()
@@ -2035,12 +2657,19 @@ class AutoKeyboardApp:
         try:
             if step.action == ACTION_DELAY:
                 self.step_action_var.set(FORM_ACTION_LABELS[FORM_ACTION_DELAY])
+                self.step_key_mode_var.set(KEY_MODE_BOTH)
             else:
                 self.step_action_var.set(FORM_ACTION_LABELS[FORM_ACTION_KEY_COMMAND])
+                if step.action == ACTION_KEY_DOWN:
+                    self.step_key_mode_var.set(KEY_MODE_DOWN)
+                elif step.action == ACTION_KEY_UP:
+                    self.step_key_mode_var.set(KEY_MODE_UP)
+                else:
+                    self.step_key_mode_var.set(KEY_MODE_BOTH)
             if step.needs_key():
                 self.step_key_var.set(step.key)
             if step.action == ACTION_DELAY:
-                self.step_delay_ms_var.set(str(step.delay_ms))
+                self.step_delay_ms_var.set(f"{step.delay_ms:,}")
             self._on_step_action_changed()
         finally:
             self._loading_step = False
@@ -2058,7 +2687,6 @@ class AutoKeyboardApp:
             self.delay_settings_frame.grid_remove()
             self.key_settings_frame.grid()
             self.status_var.set("按鍵指令會自動新增「按下按鍵」與「放開按鍵」一組指令。")
-        self._schedule_auto_save_selected_step()
 
     def _toggle_selected_script(self) -> None:
         script_id = self._selected_script_id()
@@ -2146,6 +2774,7 @@ class AutoKeyboardApp:
             self._auto_save_after_id,
             self._auto_save_step_after_id,
             self._hotkey_register_after_id,
+            self._step_drag_pulse_after_id,
         ):
             if after_id is None:
                 continue
