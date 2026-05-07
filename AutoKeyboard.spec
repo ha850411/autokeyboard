@@ -5,7 +5,10 @@ a = Analysis(
     ['autokeyboard.py'],
     pathex=[],
     binaries=[],
-    datas=[('assets/AutoKeyboard.ico', 'assets')],
+    datas=[
+        ('assets/AutoKeyboard.ico', 'assets'),
+        ('assets/check/recaptcha.jpg', 'assets/check'),
+    ],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

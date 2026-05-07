@@ -1,5 +1,5 @@
 # AutoKeyboard script wizard for Windows.
-# Python standard library only: Tkinter UI + Win32 hotkeys/keyboard input.
+# Tkinter UI + Win32 hotkeys/keyboard input.
 
 from __future__ import annotations
 
@@ -11,7 +11,10 @@ import queue
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
@@ -19,10 +22,26 @@ from typing import Iterable
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
+try:
+    from PIL import Image, ImageChops, ImageGrab, ImageStat
+except ImportError:
+    Image = None
+    ImageChops = None
+    ImageGrab = None
+    ImageStat = None
+
+try:
+    import cv2
+    import numpy as np
+except ImportError:
+    cv2 = None
+    np = None
+
 
 APP_TITLE = "AutoKeyboard 腳本精靈"
 APP_NAME = "AutoKeyboard"
 CONFIG_FILENAME = "scripts.json"
+MONITOR_CONFIG_FILENAME = "recaptcha_monitor.json"
 
 
 def app_directory() -> Path:
@@ -47,6 +66,28 @@ def user_data_directory() -> Path:
 
 LEGACY_CONFIG_PATH = app_directory() / CONFIG_FILENAME
 CONFIG_PATH = user_data_directory() / CONFIG_FILENAME
+MONITOR_CONFIG_PATH = user_data_directory() / MONITOR_CONFIG_FILENAME
+RECAPTCHA_TEMPLATE_PATH = resource_path("assets/check/recaptcha.jpg")
+RECAPTCHA_SCAN_INTERVAL_SECONDS = 1.0
+RECAPTCHA_NOTIFY_WINDOW_SECONDS = 60.0
+RECAPTCHA_NOTIFY_LIMIT = 10
+RECAPTCHA_CONFIRM_SECONDS = 3.0
+RECAPTCHA_CONFIRM_MAX_GAP_SECONDS = 1.6
+RECAPTCHA_MATCH_DOWNSAMPLE = 0.5
+RECAPTCHA_MATCH_THRESHOLD = 22.0
+RECAPTCHA_CV_MATCH_THRESHOLD = 0.94
+RECAPTCHA_VERIFY_MEAN_THRESHOLD = 20.0
+RECAPTCHA_VERIFY_GOOD_PIXEL_THRESHOLD = 42.0
+RECAPTCHA_VERIFY_GOOD_PIXEL_RATIO = 0.88
+RECAPTCHA_MATCH_SCALES = (0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.6, 0.75, 0.85, 1.0, 1.15, 1.3)
+RECAPTCHA_FOCUS_ROI = (0.12, 0.08, 0.88, 0.96)
+RECAPTCHA_FOCUS_STABLE_SECONDS = 1.2
+DISCORD_WEBHOOK_URL = (
+    "https://discord.com/api/webhooks/"
+    "1501796578107592814/"
+    "XFCFj0KZg0jF3wm2oVtrEiBVZBI6_mapRubg2mEp1hM7x_RKNtoMBtfx5X4CON2eLxUh"
+)
+DISCORD_NOTIFICATION_TEXT = "愣住！你被測謊啦"
 
 
 if platform.system() == "Windows":
@@ -98,6 +139,7 @@ MOD_NOREPEAT = 0x4000
 
 WM_HOTKEY = 0x0312
 PM_REMOVE = 0x0001
+MONITOR_DEFAULTTONEAREST = 0x00000002
 
 INPUT_KEYBOARD = 1
 KEYEVENTF_KEYUP = 0x0002
@@ -729,6 +771,38 @@ def save_scripts(scripts: list[Script]) -> None:
     CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+@dataclass
+class RecaptchaMonitorSettings:
+    enabled: bool = True
+    user_id: str = ""
+
+
+def normalize_discord_user_id(value: str) -> str:
+    return "".join(character for character in value.strip() if character.isdigit())
+
+
+def load_recaptcha_monitor_settings() -> RecaptchaMonitorSettings:
+    try:
+        if not MONITOR_CONFIG_PATH.exists():
+            return RecaptchaMonitorSettings()
+        data = json.loads(MONITOR_CONFIG_PATH.read_text(encoding="utf-8"))
+        return RecaptchaMonitorSettings(
+            enabled=bool(data.get("enabled", True)),
+            user_id=normalize_discord_user_id(str(data.get("user_id", ""))),
+        )
+    except Exception:
+        return RecaptchaMonitorSettings()
+
+
+def save_recaptcha_monitor_settings(settings: RecaptchaMonitorSettings) -> None:
+    data = {
+        "enabled": bool(settings.enabled),
+        "user_id": normalize_discord_user_id(settings.user_id),
+    }
+    MONITOR_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    MONITOR_CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 class HotkeyManager:
     def __init__(self) -> None:
         if user32 is None:
@@ -866,6 +940,460 @@ class MSG(ctypes.Structure):
         ("time", ctypes.c_ulong),
         ("pt", POINT),
     ]
+
+
+class RECT(ctypes.Structure):
+    _fields_ = [
+        ("left", ctypes.c_long),
+        ("top", ctypes.c_long),
+        ("right", ctypes.c_long),
+        ("bottom", ctypes.c_long),
+    ]
+
+
+class MONITORINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", ctypes.c_ulong),
+        ("rcMonitor", RECT),
+        ("rcWork", RECT),
+        ("dwFlags", ctypes.c_ulong),
+    ]
+
+
+@dataclass
+class PreparedTemplate:
+    image: object
+    samples: list[tuple[int, int, int, int, int]]
+    gray: object | None = None
+
+
+class FocusedWindowCapture:
+    def __init__(self, excluded_pid: int | None = None) -> None:
+        if user32 is None:
+            raise RuntimeError("此工具目前只支援 Windows。")
+        if ImageGrab is None:
+            raise RuntimeError("缺少 Pillow，請先安裝 Pillow 才能截圖比對。")
+
+        self._excluded_pid = excluded_pid
+        self._last_signature: tuple[int, tuple[int, int, int, int]] | None = None
+        self._last_signature_at = 0.0
+        user32.GetForegroundWindow.argtypes = ()
+        user32.GetForegroundWindow.restype = ctypes.c_void_p
+        user32.GetWindowRect.argtypes = (ctypes.c_void_p, ctypes.POINTER(RECT))
+        user32.GetWindowRect.restype = ctypes.c_bool
+        user32.GetWindowThreadProcessId.argtypes = (ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong))
+        user32.GetWindowThreadProcessId.restype = ctypes.c_ulong
+        user32.IsWindowVisible.argtypes = (ctypes.c_void_p,)
+        user32.IsWindowVisible.restype = ctypes.c_bool
+        user32.MonitorFromWindow.argtypes = (ctypes.c_void_p, ctypes.c_ulong)
+        user32.MonitorFromWindow.restype = ctypes.c_void_p
+        user32.GetMonitorInfoW.argtypes = (ctypes.c_void_p, ctypes.POINTER(MONITORINFO))
+        user32.GetMonitorInfoW.restype = ctypes.c_bool
+
+    def capture(self):
+        hwnd = user32.GetForegroundWindow()
+        if not hwnd or not user32.IsWindowVisible(hwnd):
+            return None
+        process_id = self._window_process_id(hwnd)
+        if self._excluded_pid is not None and process_id == self._excluded_pid:
+            return None
+
+        window_bbox = self._window_bbox(hwnd)
+        if window_bbox is None:
+            return None
+
+        monitor_bbox = self._focused_monitor_bbox(hwnd)
+        if monitor_bbox is not None:
+            window_bbox = self._intersect_bboxes(window_bbox, monitor_bbox)
+            if window_bbox is None:
+                return None
+        if not self._is_focus_stable(int(hwnd), window_bbox):
+            return None
+        window_bbox = self._center_roi_bbox(window_bbox)
+        return self._grab_bbox(window_bbox)
+
+    def _window_process_id(self, hwnd: int) -> int | None:
+        pid = ctypes.c_ulong()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        return int(pid.value) if pid.value else None
+
+    def _is_focus_stable(self, hwnd: int, bbox: tuple[int, int, int, int]) -> bool:
+        signature = (hwnd, bbox)
+        now = time.monotonic()
+        if signature != self._last_signature:
+            self._last_signature = signature
+            self._last_signature_at = now
+            return False
+        return now - self._last_signature_at >= RECAPTCHA_FOCUS_STABLE_SECONDS
+
+    def _focused_monitor_bbox(self, hwnd: int) -> tuple[int, int, int, int] | None:
+        monitor = user32.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+        if not monitor:
+            return None
+
+        info = MONITORINFO()
+        info.cbSize = ctypes.sizeof(MONITORINFO)
+        if not user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+            return None
+
+        rect = info.rcMonitor
+        if rect.right <= rect.left or rect.bottom <= rect.top:
+            return None
+        return (int(rect.left), int(rect.top), int(rect.right), int(rect.bottom))
+
+    def _window_bbox(self, hwnd: int) -> tuple[int, int, int, int] | None:
+        rect = RECT()
+        if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return None
+
+        if rect.right <= rect.left or rect.bottom <= rect.top:
+            return None
+
+        return (int(rect.left), int(rect.top), int(rect.right), int(rect.bottom))
+
+    def _intersect_bboxes(
+        self,
+        first: tuple[int, int, int, int],
+        second: tuple[int, int, int, int],
+    ) -> tuple[int, int, int, int] | None:
+        left = max(first[0], second[0])
+        top = max(first[1], second[1])
+        right = min(first[2], second[2])
+        bottom = min(first[3], second[3])
+        if right <= left or bottom <= top:
+            return None
+        return (left, top, right, bottom)
+
+    def _center_roi_bbox(self, bbox: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+        left, top, right, bottom = bbox
+        width = right - left
+        height = bottom - top
+        if width < 640 or height < 360:
+            return bbox
+
+        left_ratio, top_ratio, right_ratio, bottom_ratio = RECAPTCHA_FOCUS_ROI
+        roi = (
+            int(left + width * left_ratio),
+            int(top + height * top_ratio),
+            int(left + width * right_ratio),
+            int(top + height * bottom_ratio),
+        )
+        if roi[2] <= roi[0] or roi[3] <= roi[1]:
+            return bbox
+        return roi
+
+    def _grab_bbox(self, bbox: tuple[int, int, int, int]):
+        try:
+            return ImageGrab.grab(
+                bbox=bbox,
+                all_screens=True,
+                include_layered_windows=True,
+            ).convert("RGB")
+        except TypeError:
+            try:
+                return ImageGrab.grab(bbox=bbox, all_screens=True).convert("RGB")
+            except TypeError:
+                return ImageGrab.grab(bbox=bbox).convert("RGB")
+
+
+class ImageTemplateMatcher:
+    def __init__(
+        self,
+        template_path: Path,
+        *,
+        downsample: float = RECAPTCHA_MATCH_DOWNSAMPLE,
+        threshold: float = RECAPTCHA_MATCH_THRESHOLD,
+        scales: tuple[float, ...] = RECAPTCHA_MATCH_SCALES,
+    ) -> None:
+        if Image is None or ImageChops is None or ImageStat is None:
+            raise RuntimeError("缺少 Pillow，請先安裝 Pillow 才能讀取與比對圖片。")
+        if not template_path.exists():
+            raise FileNotFoundError(f"找不到比對圖片：{template_path}")
+
+        self._downsample = downsample
+        self._threshold = threshold
+        self._cv_threshold = RECAPTCHA_CV_MATCH_THRESHOLD
+        self._resample = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
+        self._template = Image.open(template_path).convert("RGB")
+        self._templates = self._prepare_templates(scales)
+
+    def contains(self, screenshot) -> bool:
+        if screenshot.width <= 0 or screenshot.height <= 0:
+            return False
+
+        small_size = (
+            max(1, int(screenshot.width * self._downsample)),
+            max(1, int(screenshot.height * self._downsample)),
+        )
+        small_screenshot = screenshot.resize(small_size, self._resample)
+
+        if cv2 is not None and np is not None:
+            return self._contains_with_cv(small_screenshot)
+
+        for prepared in self._templates:
+            if self._contains_template(small_screenshot, prepared):
+                return True
+        return False
+
+    def _prepare_templates(self, scales: tuple[float, ...]) -> list[PreparedTemplate]:
+        templates: list[PreparedTemplate] = []
+        for scale in scales:
+            width = max(1, int(self._template.width * scale * self._downsample))
+            height = max(1, int(self._template.height * scale * self._downsample))
+            image = self._template.resize((width, height), self._resample)
+            gray = None
+            samples: list[tuple[int, int, int, int, int]] = []
+            if cv2 is not None and np is not None:
+                gray = np.asarray(image.convert("L"))
+            else:
+                samples = self._sample_points(image)
+            templates.append(PreparedTemplate(image=image, samples=samples, gray=gray))
+        return templates
+
+    def _contains_with_cv(self, screenshot) -> bool:
+        screenshot_gray = np.asarray(screenshot.convert("L"))
+        for prepared in self._templates:
+            template_gray = prepared.gray
+            if template_gray is None:
+                continue
+            if screenshot_gray.shape[0] < template_gray.shape[0] or screenshot_gray.shape[1] < template_gray.shape[1]:
+                continue
+
+            result = cv2.matchTemplate(screenshot_gray, template_gray, cv2.TM_CCOEFF_NORMED)
+            if result.size == 0:
+                continue
+            _, max_value, _, max_location = cv2.minMaxLoc(result)
+            if max_value >= self._cv_threshold and self._verify_candidate(screenshot, prepared, max_location):
+                return True
+        return False
+
+    def _verify_candidate(self, screenshot, template: PreparedTemplate, location: tuple[int, int]) -> bool:
+        x, y = location
+        template_image = template.image
+        if x < 0 or y < 0:
+            return False
+        if x + template_image.width > screenshot.width or y + template_image.height > screenshot.height:
+            return False
+
+        crop = screenshot.crop((x, y, x + template_image.width, y + template_image.height))
+        if np is not None:
+            crop_array = np.asarray(crop).astype(np.int16)
+            template_array = np.asarray(template_image).astype(np.int16)
+            diff = np.abs(crop_array - template_array)
+            per_pixel = diff.mean(axis=2)
+            mean = float(per_pixel.mean())
+            good_ratio = float((per_pixel <= RECAPTCHA_VERIFY_GOOD_PIXEL_THRESHOLD).mean())
+            return mean <= RECAPTCHA_VERIFY_MEAN_THRESHOLD and good_ratio >= RECAPTCHA_VERIFY_GOOD_PIXEL_RATIO
+
+        diff = ImageChops.difference(crop, template_image)
+        mean = sum(ImageStat.Stat(diff).mean) / 3
+        return mean <= self._threshold
+
+    def _sample_points(self, image) -> list[tuple[int, int, int, int, int]]:
+        pixels = image.load()
+        points: list[tuple[int, int, int, int, int]] = []
+        seen: set[tuple[int, int]] = set()
+
+        def add_point(x: int, y: int) -> None:
+            key = (x, y)
+            if key in seen:
+                return
+            seen.add(key)
+            red, green, blue = pixels[x, y]
+            points.append((x, y, red, green, blue))
+
+        sparse_step = max(4, min(image.width, image.height) // 12)
+        content_step = max(2, min(image.width, image.height) // 28)
+
+        for y in range(0, image.height, content_step):
+            for x in range(0, image.width, content_step):
+                red, green, blue = pixels[x, y]
+                if red < 238 or green < 238 or blue < 238:
+                    add_point(x, y)
+
+        for y in range(0, image.height, sparse_step):
+            for x in range(0, image.width, sparse_step):
+                add_point(x, y)
+
+        for x, y in (
+            (0, 0),
+            (image.width - 1, 0),
+            (0, image.height - 1),
+            (image.width - 1, image.height - 1),
+            (image.width // 2, image.height // 2),
+        ):
+            add_point(max(0, x), max(0, y))
+
+        points.sort(key=lambda point: -(abs(point[2] - 255) + abs(point[3] - 255) + abs(point[4] - 255)))
+        if len(points) > 260:
+            points = [points[int(index * len(points) / 260)] for index in range(260)]
+        return points
+
+    def _contains_template(self, screenshot, template: PreparedTemplate) -> bool:
+        template_image = template.image
+        max_x = screenshot.width - template_image.width
+        max_y = screenshot.height - template_image.height
+        if max_x < 0 or max_y < 0:
+            return False
+
+        screenshot_pixels = screenshot.load()
+        stride = 1 if screenshot.width * screenshot.height < 100_000 else 2
+        sample_limit = int(self._threshold * len(template.samples) * 3)
+
+        for y in range(0, max_y + 1, stride):
+            for x in range(0, max_x + 1, stride):
+                error = 0
+                for sample_x, sample_y, red, green, blue in template.samples:
+                    pixel_red, pixel_green, pixel_blue = screenshot_pixels[x + sample_x, y + sample_y]
+                    error += abs(pixel_red - red) + abs(pixel_green - green) + abs(pixel_blue - blue)
+                    if error > sample_limit:
+                        break
+                else:
+                    crop = screenshot.crop((x, y, x + template_image.width, y + template_image.height))
+                    diff = ImageChops.difference(crop, template_image)
+                    mean = sum(ImageStat.Stat(diff).mean) / 3
+                    if mean <= self._threshold:
+                        return True
+
+        return False
+
+
+class RecaptchaMonitor:
+    def __init__(self, event_queue: queue.Queue[tuple[str, str]], excluded_pid: int | None = None) -> None:
+        self.events = event_queue
+        self._excluded_pid = excluded_pid
+        self._settings = RecaptchaMonitorSettings()
+        self._settings_lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._notification_times: deque[float] = deque()
+        self._last_error = ""
+        self._last_error_at = 0.0
+        self._last_rate_limited_at = 0.0
+        self._match_started_at: float | None = None
+        self._last_match_at: float | None = None
+        self._match_confirmed = False
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(target=self._run, name="RecaptchaMonitor", daemon=True)
+        self._thread.start()
+
+    def set_settings(self, settings: RecaptchaMonitorSettings) -> None:
+        normalized = RecaptchaMonitorSettings(
+            enabled=bool(settings.enabled),
+            user_id=normalize_discord_user_id(settings.user_id),
+        )
+        with self._settings_lock:
+            self._settings = normalized
+
+    def close(self) -> None:
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1)
+
+    def _run(self) -> None:
+        try:
+            capture = FocusedWindowCapture(excluded_pid=self._excluded_pid)
+            matcher = ImageTemplateMatcher(RECAPTCHA_TEMPLATE_PATH)
+        except Exception as exc:
+            self._publish("error", f"reCAPTCHA 偵測無法啟動：{exc}")
+            return
+
+        self._publish("ready", "reCAPTCHA 偵測已啟動。")
+        while not self._stop_event.is_set():
+            started_at = time.monotonic()
+            settings = self._settings_snapshot()
+            if settings.enabled and settings.user_id:
+                try:
+                    screenshot = capture.capture()
+                    matched = screenshot is not None and matcher.contains(screenshot)
+                    if matched and self._is_confirmed_match():
+                        self._notify_if_allowed(settings.user_id)
+                    elif not matched:
+                        self._reset_match_confirmation()
+                except Exception as exc:
+                    self._publish_error(f"reCAPTCHA 偵測錯誤：{exc}")
+
+            else:
+                self._reset_match_confirmation()
+
+            elapsed = time.monotonic() - started_at
+            self._stop_event.wait(max(0.05, RECAPTCHA_SCAN_INTERVAL_SECONDS - elapsed))
+
+    def _is_confirmed_match(self) -> bool:
+        now = time.monotonic()
+        if self._last_match_at is None or now - self._last_match_at > RECAPTCHA_CONFIRM_MAX_GAP_SECONDS:
+            self._match_started_at = now
+            self._match_confirmed = False
+        elif self._match_started_at is None:
+            self._match_started_at = now
+
+        self._last_match_at = now
+        if not self._match_confirmed and now - self._match_started_at >= RECAPTCHA_CONFIRM_SECONDS:
+            self._match_confirmed = True
+        return self._match_confirmed
+
+    def _reset_match_confirmation(self) -> None:
+        self._match_started_at = None
+        self._last_match_at = None
+        self._match_confirmed = False
+
+    def _settings_snapshot(self) -> RecaptchaMonitorSettings:
+        with self._settings_lock:
+            return RecaptchaMonitorSettings(
+                enabled=self._settings.enabled,
+                user_id=self._settings.user_id,
+            )
+
+    def _notify_if_allowed(self, user_id: str) -> None:
+        now = time.monotonic()
+        while self._notification_times and now - self._notification_times[0] >= RECAPTCHA_NOTIFY_WINDOW_SECONDS:
+            self._notification_times.popleft()
+
+        if len(self._notification_times) >= RECAPTCHA_NOTIFY_LIMIT:
+            if now - self._last_rate_limited_at >= 10:
+                self._last_rate_limited_at = now
+                self._publish("rate_limited", "已達 Discord 通知上限，暫停送出。")
+            return
+
+        self._notification_times.append(now)
+        self._post_discord_webhook(user_id)
+        self._publish("notified", "偵測到 reCAPTCHA，已通知 Discord。")
+
+    def _post_discord_webhook(self, user_id: str) -> None:
+        payload = {
+            "content": f"<@{user_id}> {DISCORD_NOTIFICATION_TEXT}",
+            "allowed_mentions": {"users": [user_id]},
+        }
+        request = urllib.request.Request(
+            DISCORD_WEBHOOK_URL,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": f"{APP_NAME}/1.0",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                if response.status not in (200, 204):
+                    raise RuntimeError(f"Discord webhook 回應 HTTP {response.status}")
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")[:200]
+            raise RuntimeError(f"Discord webhook 回應 HTTP {exc.code}: {detail}") from exc
+
+    def _publish(self, event_type: str, detail: str) -> None:
+        self.events.put((event_type, detail))
+
+    def _publish_error(self, detail: str) -> None:
+        now = time.monotonic()
+        if detail == self._last_error and now - self._last_error_at < 30:
+            return
+        self._last_error = detail
+        self._last_error_at = now
+        self._publish("error", detail)
 
 
 class ScriptRunner:
@@ -1128,19 +1656,28 @@ class AutoKeyboardApp:
         self._set_window_icon()
 
         self.scripts = load_scripts()
+        self.recaptcha_settings = load_recaptcha_monitor_settings()
         self.keyboard = WindowsKeyboard()
         self.hotkeys = HotkeyManager()
         self.runtime_events: queue.Queue[tuple] = queue.Queue()
+        self.monitor_events: queue.Queue[tuple[str, str]] = queue.Queue()
+        self.recaptcha_monitor = RecaptchaMonitor(self.monitor_events, excluded_pid=os.getpid())
         self.runners: dict[str, ScriptRunner] = {}
         self.current_step: dict[str, str] = {}
         self._loading_script = False
         self._loading_step = False
+        self._loading_recaptcha_settings = False
         self._recording_hotkey = False
         self._closing = False
         self._auto_save_after_id: str | None = None
         self._auto_save_step_after_id: str | None = None
         self._hotkey_register_after_id: str | None = None
+        self._recaptcha_save_after_id: str | None = None
         self._poll_after_id: str | None = None
+        self._script_drag_start_y: int | None = None
+        self._script_drag_start_id: str | None = None
+        self._script_dragging = False
+        self._script_drag_insert_index: int | None = None
         self._step_drag_start_y: int | None = None
         self._step_drag_indices: list[int] = []
         self._step_dragging = False
@@ -1159,12 +1696,18 @@ class AutoKeyboardApp:
         self.step_key_mode_var = tk.StringVar(value=KEY_MODE_BOTH)
         self.step_key_var = tk.StringVar(value="SPACE")
         self.step_delay_ms_var = tk.StringVar(value="1,000")
+        self.recaptcha_enabled_var = tk.BooleanVar(value=self.recaptcha_settings.enabled)
+        self.recaptcha_user_id_var = tk.StringVar(value=self.recaptcha_settings.user_id)
+        self.recaptcha_status_var = tk.StringVar(value="")
         self.banner_var = tk.StringVar(value="待命")
         self.status_var = tk.StringVar(value="準備就緒")
 
         self._configure_style()
         self._build_ui()
         self._bind_auto_save()
+        self.recaptcha_monitor.set_settings(self.recaptcha_settings)
+        self.recaptcha_monitor.start()
+        self._update_recaptcha_status_from_settings(saved=False)
         self._refresh_script_tree()
         self._select_first_script()
         self._register_hotkeys(show_dialog=False)
@@ -1352,8 +1895,12 @@ class AutoKeyboardApp:
         self.script_tree.column("status", width=120, minwidth=100)
         self.script_tree.tag_configure("running", background="#dbeafe")
         self.script_tree.tag_configure("stopping", background="#fef3c7")
+        self.script_tree.tag_configure("script_dragging", background="#bfdbfe")
         self.script_tree.grid(row=1, column=0, sticky="nsew")
         self.script_tree.bind("<<TreeviewSelect>>", self._on_script_selected)
+        self.script_tree.bind("<ButtonPress-1>", self._on_script_drag_start)
+        self.script_tree.bind("<B1-Motion>", self._on_script_drag_motion)
+        self.script_tree.bind("<ButtonRelease-1>", self._on_script_drag_release)
 
         script_buttons = ttk.Frame(left, style="Toolbar.TFrame")
         script_buttons.grid(row=2, column=0, sticky="ew", pady=(12, 0))
@@ -1382,6 +1929,36 @@ class AutoKeyboardApp:
             command=self._toggle_selected_script,
         )
         self.toggle_button.grid(row=1, column=2, sticky="ew", padx=(4, 0), pady=(8, 0))
+
+        ttk.Separator(left).grid(row=3, column=0, sticky="ew", pady=(14, 10))
+        monitor_frame = ttk.Frame(left, style="Panel.TFrame")
+        monitor_frame.grid(row=4, column=0, sticky="ew")
+        monitor_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(monitor_frame, text="reCAPTCHA 通知", style="Title.TLabel").grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, 8)
+        )
+        ttk.Checkbutton(
+            monitor_frame,
+            text="每秒檢查 focus 視窗",
+            variable=self.recaptcha_enabled_var,
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        ttk.Label(monitor_frame, text="User ID", style="Panel.TLabel").grid(
+            row=2, column=0, sticky="w", padx=(0, 8)
+        )
+        self.recaptcha_user_id_entry = RoundedEntry(
+            monitor_frame,
+            textvariable=self.recaptcha_user_id_var,
+            colors=self.colors,
+            width=18,
+        )
+        self.recaptcha_user_id_entry.grid(row=2, column=1, sticky="ew")
+        ttk.Label(
+            monitor_frame,
+            textvariable=self.recaptcha_status_var,
+            style="Small.TLabel",
+            wraplength=240,
+        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
         right.columnconfigure(0, weight=1)
         right.rowconfigure(3, weight=1)
@@ -1582,7 +2159,8 @@ class AutoKeyboardApp:
     def _refresh_script_tree(self) -> None:
         selected = self._selected_script_id()
         existing = set(self.script_tree.get_children())
-        wanted = {script.id for script in self.scripts}
+        wanted_order = [script.id for script in self.scripts]
+        wanted = set(wanted_order)
 
         for item in existing - wanted:
             self.script_tree.delete(item)
@@ -1590,17 +2168,151 @@ class AutoKeyboardApp:
         for index, script in enumerate(self.scripts):
             values = (script.name, script.hotkey or "手動", self._status_for(script.id))
             tags = self._tags_for(script.id)
+            if self._script_dragging and script.id == self._script_drag_start_id:
+                tags = tags + ("script_dragging",)
             if script.id in existing:
-                self.script_tree.item(script.id, values=values, tags=tags)
+                current_values = tuple(self.script_tree.item(script.id, "values"))
+                current_tags = tuple(self.script_tree.item(script.id, "tags"))
+                if current_values != values or current_tags != tags:
+                    self.script_tree.item(script.id, values=values, tags=tags)
             else:
                 self.script_tree.insert("", index, iid=script.id, values=values, tags=tags)
 
+        if not self._script_dragging:
+            self._sync_script_tree_order(wanted_order)
         if selected in wanted:
-            self.script_tree.selection_set(selected)
-            self.script_tree.focus(selected)
+            if self.script_tree.selection() != (selected,):
+                self.script_tree.selection_set(selected)
+            if self.script_tree.focus() != selected:
+                self.script_tree.focus(selected)
 
         self._update_banner()
         self._update_toggle_button()
+
+    def _sync_script_tree_order(self, wanted_order: list[str]) -> None:
+        if list(self.script_tree.get_children()) == wanted_order:
+            return
+
+        for index, script_id in enumerate(wanted_order):
+            if self.script_tree.exists(script_id):
+                self.script_tree.move(script_id, "", index)
+
+    def _reset_script_drag_state(self) -> None:
+        self._script_drag_start_y = None
+        self._script_drag_start_id = None
+        self._script_dragging = False
+        self._script_drag_insert_index = None
+        self._retag_script_tree_display_order()
+
+    def _apply_script_drag_preview(self, insert_index: int) -> None:
+        dragged_id = self._script_drag_start_id
+        current_order = list(self.script_tree.get_children())
+        if dragged_id is None or dragged_id not in current_order:
+            return
+        if self._script_drag_insert_index == insert_index:
+            return
+
+        self._script_drag_insert_index = insert_index
+        dragged_position = current_order.index(dragged_id)
+        adjusted_index = insert_index - (1 if dragged_position < insert_index else 0)
+        adjusted_index = max(0, min(adjusted_index, len(current_order) - 1))
+
+        if dragged_position != adjusted_index:
+            self.script_tree.move(dragged_id, "", adjusted_index)
+        self.script_tree.selection_set(dragged_id)
+        self.script_tree.focus(dragged_id)
+        self._retag_script_tree_display_order(dragging_id=dragged_id)
+
+    def _retag_script_tree_display_order(self, dragging_id: str | None = None) -> None:
+        for item in self.script_tree.get_children():
+            tags = list(self._tags_for(item))
+            if item == dragging_id:
+                tags.append("script_dragging")
+            self.script_tree.item(item, tags=tuple(tags))
+
+    def _on_script_drag_start(self, event: tk.Event) -> str | None:
+        if self.script_tree.identify_region(event.x, event.y) == "heading":
+            return None
+
+        row = self.script_tree.identify_row(event.y)
+        if not row:
+            self._reset_script_drag_state()
+            return None
+
+        self._script_drag_start_y = event.y
+        self._script_drag_start_id = row
+        self._script_dragging = False
+        self._script_drag_insert_index = None
+        return None
+
+    def _on_script_drag_motion(self, event: tk.Event) -> str | None:
+        if self._script_drag_start_y is None or self._script_drag_start_id is None:
+            return None
+        if not self._script_dragging and abs(event.y - self._script_drag_start_y) < 6:
+            return None
+        if self.script_tree.identify_region(event.x, event.y) == "heading":
+            return None
+        if self._script_drag_start_id not in self.script_tree.get_children():
+            self._reset_script_drag_state()
+            return None
+
+        self._script_dragging = True
+        insert_index = self._script_drop_index(event.y)
+        self._apply_script_drag_preview(insert_index)
+        if event.y < 0:
+            self.script_tree.yview_scroll(-1, "units")
+        elif event.y > self.script_tree.winfo_height():
+            self.script_tree.yview_scroll(1, "units")
+        self.status_var.set(f"拖曳排序腳本到第 {insert_index + 1} 個位置。")
+        return "break"
+
+    def _on_script_drag_release(self, _event: tk.Event) -> str | None:
+        if not self._script_dragging or self._script_drag_start_id is None:
+            self._reset_script_drag_state()
+            return None
+
+        moved_id = self._script_drag_start_id
+        preview_order = list(self.script_tree.get_children())
+        self._reset_script_drag_state()
+        self._apply_script_preview_order(preview_order, moved_id)
+        return "break"
+
+    def _script_drop_index(self, y: int) -> int:
+        script_count = len(self.scripts)
+        children = list(self.script_tree.get_children())
+        row = self.script_tree.identify_row(y)
+        if not row:
+            return script_count if y > self.script_tree.winfo_height() // 2 else 0
+
+        try:
+            row_index = children.index(row)
+        except ValueError:
+            return script_count
+
+        bbox = self.script_tree.bbox(row)
+        if bbox and y > bbox[1] + (bbox[3] // 2):
+            row_index += 1
+        return max(0, min(row_index, script_count))
+
+    def _apply_script_preview_order(self, item_order: list[str], moved_id: str) -> None:
+        script_by_id = {script.id: script for script in self.scripts}
+        ordered_scripts = [script_by_id[item] for item in item_order if item in script_by_id]
+        if len(ordered_scripts) != len(self.scripts):
+            self._refresh_script_tree()
+            return
+
+        if ordered_scripts == self.scripts:
+            self._refresh_script_tree()
+            self.script_tree.selection_set(moved_id)
+            self.script_tree.focus(moved_id)
+            return
+
+        self.scripts = ordered_scripts
+        self._save_all()
+        self._refresh_script_tree()
+        self.script_tree.selection_set(moved_id)
+        self.script_tree.focus(moved_id)
+        self.status_var.set("已調整腳本順序。")
 
     def _refresh_step_tree(self, script: Script | None = None) -> None:
         self._stop_step_drag_pulse()
@@ -1868,6 +2580,8 @@ class AutoKeyboardApp:
             variable.trace_add("write", self._schedule_auto_save_script_settings)
         for variable in (self.step_key_mode_var, self.step_key_var, self.step_delay_ms_var):
             variable.trace_add("write", self._schedule_auto_save_selected_step)
+        for variable in (self.recaptcha_enabled_var, self.recaptcha_user_id_var):
+            variable.trace_add("write", self._schedule_recaptcha_settings_save)
 
     def _schedule_auto_save_script_settings(self, *_args) -> None:
         if self._loading_script:
@@ -1913,6 +2627,49 @@ class AutoKeyboardApp:
         if changed:
             self.status_var.set("腳本設定已自動儲存。")
         self._schedule_hotkey_register()
+
+    def _schedule_recaptcha_settings_save(self, *_args) -> None:
+        if self._loading_recaptcha_settings:
+            return
+        if self._recaptcha_save_after_id is not None:
+            self.root.after_cancel(self._recaptcha_save_after_id)
+        self._recaptcha_save_after_id = self.root.after(300, self._save_recaptcha_settings_from_ui)
+
+    def _save_recaptcha_settings_from_ui(self) -> None:
+        self._recaptcha_save_after_id = None
+        user_id = normalize_discord_user_id(self.recaptcha_user_id_var.get())
+        if user_id != self.recaptcha_user_id_var.get().strip():
+            self._loading_recaptcha_settings = True
+            try:
+                self.recaptcha_user_id_var.set(user_id)
+            finally:
+                self._loading_recaptcha_settings = False
+
+        settings = RecaptchaMonitorSettings(
+            enabled=bool(self.recaptcha_enabled_var.get()),
+            user_id=user_id,
+        )
+        self.recaptcha_settings = settings
+        try:
+            save_recaptcha_monitor_settings(settings)
+        except OSError as exc:
+            self.recaptcha_status_var.set(f"儲存 reCAPTCHA 設定失敗：{exc}")
+            return
+
+        self.recaptcha_monitor.set_settings(settings)
+        self._update_recaptcha_status_from_settings(saved=True)
+
+    def _update_recaptcha_status_from_settings(self, *, saved: bool) -> None:
+        if not self.recaptcha_enabled_var.get():
+            message = "偵測已關閉。"
+        elif not normalize_discord_user_id(self.recaptcha_user_id_var.get()):
+            message = "請輸入 Discord User ID 後開始偵測。"
+        else:
+            message = "偵測 focus 視窗中央區域；連續 3 秒高精度命中才通知。60 秒最多通知 10 次。"
+
+        if saved:
+            message = f"{message} 已儲存。"
+        self.recaptcha_status_var.set(message)
 
     def _schedule_hotkey_register(self) -> None:
         if self._hotkey_register_after_id is not None:
@@ -2649,19 +3406,22 @@ class AutoKeyboardApp:
 
     def _move_step(self, direction: int) -> None:
         script = self._selected_script()
-        index = self._current_step_index()
-        if script is None or index is None:
+        if script is None:
             return
 
-        new_index = index + direction
-        if new_index < 0 or new_index >= len(script.steps):
+        indices = self._selected_step_indices()
+        if not indices:
             return
 
-        script.steps[index], script.steps[new_index] = script.steps[new_index], script.steps[index]
-        self._save_all()
-        self._refresh_step_tree(script)
-        self.step_tree.selection_set(str(new_index))
-        self.status_var.set("已調整步驟順序。")
+        if direction < 0:
+            if indices[0] <= 0:
+                return
+            self._move_steps_to_index(script, indices, indices[0] - 1)
+        else:
+            if indices[-1] >= len(script.steps) - 1:
+                return
+            self._move_steps_to_index(script, indices, indices[-1] + 2)
+        self.status_var.set(f"已調整 {len(indices)} 個步驟順序。")
 
     def _on_step_selected(self, _event: tk.Event | None = None) -> None:
         if self._loading_step:
@@ -2764,6 +3524,7 @@ class AutoKeyboardApp:
                 break
             self._toggle_script(script_id)
 
+        script_tree_needs_refresh = False
         while True:
             try:
                 event_type, script_id, detail = self.runtime_events.get_nowait()
@@ -2779,7 +3540,27 @@ class AutoKeyboardApp:
             elif event_type == "stopped":
                 self.runners.pop(script_id, None)
                 self.current_step.pop(script_id, None)
+            script_tree_needs_refresh = True
+
+        if script_tree_needs_refresh:
             self._refresh_script_tree()
+
+        while True:
+            try:
+                event_type, detail = self.monitor_events.get_nowait()
+            except queue.Empty:
+                break
+
+            if event_type == "ready":
+                self._update_recaptcha_status_from_settings(saved=False)
+            elif event_type == "notified":
+                self.recaptcha_status_var.set(detail)
+                self.status_var.set(detail)
+            elif event_type == "rate_limited":
+                self.recaptcha_status_var.set(detail)
+            elif event_type == "error":
+                self.recaptcha_status_var.set(detail)
+                self.status_var.set(detail)
 
         self._poll_after_id = self.root.after(80, self._poll_events)
 
@@ -2788,11 +3569,13 @@ class AutoKeyboardApp:
             return
 
         self._closing = True
+        pending_recaptcha_save = self._recaptcha_save_after_id is not None
         for after_id in (
             self._poll_after_id,
             self._auto_save_after_id,
             self._auto_save_step_after_id,
             self._hotkey_register_after_id,
+            self._recaptcha_save_after_id,
             self._step_drag_pulse_after_id,
         ):
             if after_id is None:
@@ -2802,8 +3585,12 @@ class AutoKeyboardApp:
             except tk.TclError:
                 pass
 
+        if pending_recaptcha_save:
+            self._save_recaptcha_settings_from_ui()
+
         for runner in list(self.runners.values()):
             runner.stop()
+        self.recaptcha_monitor.close()
         self.hotkeys.close()
         deadline = time.monotonic() + 1.0
         for runner in list(self.runners.values()):
