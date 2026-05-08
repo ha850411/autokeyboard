@@ -68,20 +68,26 @@ LEGACY_CONFIG_PATH = app_directory() / CONFIG_FILENAME
 CONFIG_PATH = user_data_directory() / CONFIG_FILENAME
 MONITOR_CONFIG_PATH = user_data_directory() / MONITOR_CONFIG_FILENAME
 RECAPTCHA_TEMPLATE_PATH = resource_path("assets/check/recaptcha.jpg")
-RECAPTCHA_SCAN_INTERVAL_SECONDS = 1.0
+RECAPTCHA_SCAN_INTERVAL_SECONDS = 0.5
+RECAPTCHA_FEATURE_SCAN_INTERVAL_SECONDS = 0.33
 RECAPTCHA_NOTIFY_WINDOW_SECONDS = 60.0
-RECAPTCHA_NOTIFY_LIMIT = 10
-RECAPTCHA_CONFIRM_SECONDS = 3.0
+RECAPTCHA_NOTIFY_LIMIT = 60
+RECAPTCHA_REPEAT_NOTIFY_SECONDS = 1.0
+RECAPTCHA_CONFIRM_SECONDS = 2.0
 RECAPTCHA_CONFIRM_MAX_GAP_SECONDS = 1.6
+RECAPTCHA_MATCH_MISS_GRACE_SECONDS = 0.85
 RECAPTCHA_MATCH_DOWNSAMPLE = 0.5
+RECAPTCHA_FULL_RES_MAX_PIXELS = 1_000_000
 RECAPTCHA_MATCH_THRESHOLD = 22.0
 RECAPTCHA_CV_MATCH_THRESHOLD = 0.94
+RECAPTCHA_TINY_CV_MATCH_THRESHOLD = 0.88
+RECAPTCHA_SMALL_CV_MATCH_THRESHOLD = 0.9
 RECAPTCHA_VERIFY_MEAN_THRESHOLD = 20.0
 RECAPTCHA_VERIFY_GOOD_PIXEL_THRESHOLD = 42.0
 RECAPTCHA_VERIFY_GOOD_PIXEL_RATIO = 0.88
-RECAPTCHA_MATCH_SCALES = (0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.6, 0.75, 0.85, 1.0, 1.15, 1.3)
-RECAPTCHA_FOCUS_ROI = (0.12, 0.08, 0.88, 0.96)
-RECAPTCHA_FOCUS_STABLE_SECONDS = 1.2
+RECAPTCHA_MATCH_SCALES = (0.12, 0.13, 0.14, 0.15, 0.16, 0.18, 0.2, 0.22, 0.24, 0.25, 0.26, 0.28, 0.3, 0.33, 0.35, 0.4, 0.45, 0.5, 0.6, 0.75, 0.85, 0.9, 1.0, 1.05, 1.15, 1.2, 1.35)
+RECAPTCHA_FOCUS_ROI = (0.06, 0.04, 0.94, 0.98)
+RECAPTCHA_FOCUS_STABLE_SECONDS = 0.3
 DISCORD_WEBHOOK_URL = (
     "https://discord.com/api/webhooks/"
     "1501796578107592814/"
@@ -965,6 +971,13 @@ class PreparedTemplate:
     image: object
     samples: list[tuple[int, int, int, int, int]]
     gray: object | None = None
+    scale: float = 1.0
+
+
+@dataclass(frozen=True)
+class ImageMatchResult:
+    matched: bool
+    has_features: bool
 
 
 class FocusedWindowCapture:
@@ -1113,33 +1126,78 @@ class ImageTemplateMatcher:
         self._downsample = downsample
         self._threshold = threshold
         self._cv_threshold = RECAPTCHA_CV_MATCH_THRESHOLD
+        self._scales = scales
         self._resample = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
         self._template = Image.open(template_path).convert("RGB")
-        self._templates = self._prepare_templates(scales)
+        self._templates_by_downsample: dict[float, list[PreparedTemplate]] = {}
 
     def contains(self, screenshot) -> bool:
-        if screenshot.width <= 0 or screenshot.height <= 0:
-            return False
+        return self.analyze(screenshot).matched
 
+    def analyze(self, screenshot) -> ImageMatchResult:
+        if screenshot.width <= 0 or screenshot.height <= 0:
+            return ImageMatchResult(matched=False, has_features=False)
+
+        downsample = self._effective_downsample(screenshot)
         small_size = (
-            max(1, int(screenshot.width * self._downsample)),
-            max(1, int(screenshot.height * self._downsample)),
+            max(1, int(screenshot.width * downsample)),
+            max(1, int(screenshot.height * downsample)),
         )
         small_screenshot = screenshot.resize(small_size, self._resample)
+        if not self._has_recaptcha_palette(small_screenshot):
+            return ImageMatchResult(matched=False, has_features=False)
+
+        templates = self._templates_for_downsample(downsample)
 
         if cv2 is not None and np is not None:
-            return self._contains_with_cv(small_screenshot)
+            return ImageMatchResult(
+                matched=self._contains_with_cv(small_screenshot, templates),
+                has_features=True,
+            )
 
-        for prepared in self._templates:
+        for prepared in templates:
             if self._contains_template(small_screenshot, prepared):
-                return True
-        return False
+                return ImageMatchResult(matched=True, has_features=True)
+        return ImageMatchResult(matched=False, has_features=True)
 
-    def _prepare_templates(self, scales: tuple[float, ...]) -> list[PreparedTemplate]:
+    def _effective_downsample(self, screenshot) -> float:
+        if cv2 is None or np is None:
+            return self._downsample
+        if screenshot.width * screenshot.height <= RECAPTCHA_FULL_RES_MAX_PIXELS:
+            return 1.0
+        return self._downsample
+
+    def _has_recaptcha_palette(self, screenshot) -> bool:
+        if np is None:
+            return True
+
+        pixels = np.asarray(screenshot)
+        if pixels.size == 0:
+            return False
+
+        red = pixels[:, :, 0].astype(np.int16)
+        green = pixels[:, :, 1].astype(np.int16)
+        blue = pixels[:, :, 2].astype(np.int16)
+        bright_pixels = (red > 210) & (green > 210) & (blue > 210)
+        button_blue_pixels = (blue > 140) & (green > 70) & (green < 210) & (red < 140) & ((blue - red) > 45)
+        area = screenshot.width * screenshot.height
+        min_bright_pixels = max(80, int(area * 0.0004))
+        min_blue_pixels = max(24, int(area * 0.00015))
+        return int(bright_pixels.sum()) >= min_bright_pixels and int(button_blue_pixels.sum()) >= min_blue_pixels
+
+    def _templates_for_downsample(self, downsample: float) -> list[PreparedTemplate]:
+        key = round(downsample, 3)
+        templates = self._templates_by_downsample.get(key)
+        if templates is None:
+            templates = self._prepare_templates(self._scales, downsample)
+            self._templates_by_downsample[key] = templates
+        return templates
+
+    def _prepare_templates(self, scales: tuple[float, ...], downsample: float) -> list[PreparedTemplate]:
         templates: list[PreparedTemplate] = []
         for scale in scales:
-            width = max(1, int(self._template.width * scale * self._downsample))
-            height = max(1, int(self._template.height * scale * self._downsample))
+            width = max(1, int(self._template.width * scale * downsample))
+            height = max(1, int(self._template.height * scale * downsample))
             image = self._template.resize((width, height), self._resample)
             gray = None
             samples: list[tuple[int, int, int, int, int]] = []
@@ -1147,12 +1205,12 @@ class ImageTemplateMatcher:
                 gray = np.asarray(image.convert("L"))
             else:
                 samples = self._sample_points(image)
-            templates.append(PreparedTemplate(image=image, samples=samples, gray=gray))
+            templates.append(PreparedTemplate(image=image, samples=samples, gray=gray, scale=scale))
         return templates
 
-    def _contains_with_cv(self, screenshot) -> bool:
+    def _contains_with_cv(self, screenshot, templates: list[PreparedTemplate]) -> bool:
         screenshot_gray = np.asarray(screenshot.convert("L"))
-        for prepared in self._templates:
+        for prepared in templates:
             template_gray = prepared.gray
             if template_gray is None:
                 continue
@@ -1163,9 +1221,16 @@ class ImageTemplateMatcher:
             if result.size == 0:
                 continue
             _, max_value, _, max_location = cv2.minMaxLoc(result)
-            if max_value >= self._cv_threshold and self._verify_candidate(screenshot, prepared, max_location):
+            if max_value >= self._cv_threshold_for(prepared) and self._verify_candidate(screenshot, prepared, max_location):
                 return True
         return False
+
+    def _cv_threshold_for(self, template: PreparedTemplate) -> float:
+        if template.scale <= 0.35:
+            return RECAPTCHA_TINY_CV_MATCH_THRESHOLD
+        if template.scale <= 0.55:
+            return RECAPTCHA_SMALL_CV_MATCH_THRESHOLD
+        return self._cv_threshold
 
     def _verify_candidate(self, screenshot, template: PreparedTemplate, location: tuple[int, int]) -> bool:
         x, y = location
@@ -1182,12 +1247,25 @@ class ImageTemplateMatcher:
             diff = np.abs(crop_array - template_array)
             per_pixel = diff.mean(axis=2)
             mean = float(per_pixel.mean())
-            good_ratio = float((per_pixel <= RECAPTCHA_VERIFY_GOOD_PIXEL_THRESHOLD).mean())
-            return mean <= RECAPTCHA_VERIFY_MEAN_THRESHOLD and good_ratio >= RECAPTCHA_VERIFY_GOOD_PIXEL_RATIO
+            mean_threshold, good_pixel_threshold, good_pixel_ratio = self._verify_thresholds(template)
+            good_ratio = float((per_pixel <= good_pixel_threshold).mean())
+            return mean <= mean_threshold and good_ratio >= good_pixel_ratio
 
         diff = ImageChops.difference(crop, template_image)
         mean = sum(ImageStat.Stat(diff).mean) / 3
-        return mean <= self._threshold
+        mean_threshold, _, _ = self._verify_thresholds(template)
+        return mean <= max(self._threshold, mean_threshold)
+
+    def _verify_thresholds(self, template: PreparedTemplate) -> tuple[float, float, float]:
+        if template.scale <= 0.35:
+            return 34.0, 70.0, 0.72
+        if template.scale <= 0.55:
+            return 28.0, 58.0, 0.78
+        return (
+            RECAPTCHA_VERIFY_MEAN_THRESHOLD,
+            RECAPTCHA_VERIFY_GOOD_PIXEL_THRESHOLD,
+            RECAPTCHA_VERIFY_GOOD_PIXEL_RATIO,
+        )
 
     def _sample_points(self, image) -> list[tuple[int, int, int, int, int]]:
         pixels = image.load()
@@ -1238,7 +1316,8 @@ class ImageTemplateMatcher:
 
         screenshot_pixels = screenshot.load()
         stride = 1 if screenshot.width * screenshot.height < 100_000 else 2
-        sample_limit = int(self._threshold * len(template.samples) * 3)
+        mean_threshold, _, _ = self._verify_thresholds(template)
+        sample_limit = int(max(self._threshold, mean_threshold) * len(template.samples) * 3)
 
         for y in range(0, max_y + 1, stride):
             for x in range(0, max_x + 1, stride):
@@ -1252,7 +1331,7 @@ class ImageTemplateMatcher:
                     crop = screenshot.crop((x, y, x + template_image.width, y + template_image.height))
                     diff = ImageChops.difference(crop, template_image)
                     mean = sum(ImageStat.Stat(diff).mean) / 3
-                    if mean <= self._threshold:
+                    if mean <= max(self._threshold, mean_threshold):
                         return True
 
         return False
@@ -1273,6 +1352,7 @@ class RecaptchaMonitor:
         self._match_started_at: float | None = None
         self._last_match_at: float | None = None
         self._match_confirmed = False
+        self._last_match_notification_at: float | None = None
 
     def start(self) -> None:
         if self._thread is not None:
@@ -1304,15 +1384,22 @@ class RecaptchaMonitor:
         self._publish("ready", "reCAPTCHA 偵測已啟動。")
         while not self._stop_event.is_set():
             started_at = time.monotonic()
+            scan_interval = RECAPTCHA_SCAN_INTERVAL_SECONDS
             settings = self._settings_snapshot()
             if settings.enabled and settings.user_id:
                 try:
                     screenshot = capture.capture()
-                    matched = screenshot is not None and matcher.contains(screenshot)
+                    result = matcher.analyze(screenshot) if screenshot is not None else ImageMatchResult(
+                        matched=False,
+                        has_features=False,
+                    )
+                    matched = result.matched
+                    if result.has_features:
+                        scan_interval = RECAPTCHA_FEATURE_SCAN_INTERVAL_SECONDS
                     if matched and self._is_confirmed_match():
-                        self._notify_if_allowed(settings.user_id)
+                        self._notify_match_if_due(settings.user_id)
                     elif not matched:
-                        self._reset_match_confirmation()
+                        self._mark_match_missing()
                 except Exception as exc:
                     self._publish_error(f"reCAPTCHA 偵測錯誤：{exc}")
 
@@ -1320,7 +1407,7 @@ class RecaptchaMonitor:
                 self._reset_match_confirmation()
 
             elapsed = time.monotonic() - started_at
-            self._stop_event.wait(max(0.05, RECAPTCHA_SCAN_INTERVAL_SECONDS - elapsed))
+            self._stop_event.wait(max(0.05, scan_interval - elapsed))
 
     def _is_confirmed_match(self) -> bool:
         now = time.monotonic()
@@ -1335,10 +1422,18 @@ class RecaptchaMonitor:
             self._match_confirmed = True
         return self._match_confirmed
 
+    def _mark_match_missing(self) -> None:
+        if self._last_match_at is None:
+            self._reset_match_confirmation()
+            return
+        if time.monotonic() - self._last_match_at >= RECAPTCHA_MATCH_MISS_GRACE_SECONDS:
+            self._reset_match_confirmation()
+
     def _reset_match_confirmation(self) -> None:
         self._match_started_at = None
         self._last_match_at = None
         self._match_confirmed = False
+        self._last_match_notification_at = None
 
     def _settings_snapshot(self) -> RecaptchaMonitorSettings:
         with self._settings_lock:
@@ -1347,7 +1442,18 @@ class RecaptchaMonitor:
                 user_id=self._settings.user_id,
             )
 
-    def _notify_if_allowed(self, user_id: str) -> None:
+    def _notify_match_if_due(self, user_id: str) -> None:
+        now = time.monotonic()
+        if (
+            self._last_match_notification_at is not None
+            and now - self._last_match_notification_at < RECAPTCHA_REPEAT_NOTIFY_SECONDS
+        ):
+            return
+
+        if self._notify_if_allowed(user_id):
+            self._last_match_notification_at = now
+
+    def _notify_if_allowed(self, user_id: str) -> bool:
         now = time.monotonic()
         while self._notification_times and now - self._notification_times[0] >= RECAPTCHA_NOTIFY_WINDOW_SECONDS:
             self._notification_times.popleft()
@@ -1356,11 +1462,12 @@ class RecaptchaMonitor:
             if now - self._last_rate_limited_at >= 10:
                 self._last_rate_limited_at = now
                 self._publish("rate_limited", "已達 Discord 通知上限，暫停送出。")
-            return
+            return False
 
         self._notification_times.append(now)
         self._post_discord_webhook(user_id)
         self._publish("notified", "偵測到 reCAPTCHA，已通知 Discord。")
+        return True
 
     def _post_discord_webhook(self, user_id: str) -> None:
         payload = {
