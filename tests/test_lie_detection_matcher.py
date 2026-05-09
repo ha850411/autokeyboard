@@ -10,7 +10,12 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from autokeyboard import ImageTemplateMatcher, RECAPTCHA_TEMPLATE_PATH
+from autokeyboard import (
+    ImageTemplateMatcher,
+    RECAPTCHA_MATCH_SCALE_STEP_RATIO,
+    RECAPTCHA_TEMPLATE_PATH,
+    build_recaptcha_match_scales,
+)
 
 
 FALSE_POSITIVE_DIR = ROOT / "tests" / "fixtures" / "lie_detection_false_positives"
@@ -46,9 +51,13 @@ def maple_shop_like_screenshot() -> Image.Image:
     return image
 
 
-def screenshot_with_scaled_lie_detection(scale: float) -> Image.Image:
+def screenshot_with_scaled_lie_detection(scale: float, *, checked: bool = False) -> Image.Image:
     canvas = Image.new("RGB", (1366, 768), (0, 0, 0))
     template = Image.open(RECAPTCHA_TEMPLATE_PATH).convert("RGB")
+    if checked:
+        draw = ImageDraw.Draw(template)
+        draw.rounded_rectangle((26, 55, 68, 98), radius=5, outline=(48, 164, 154), width=4)
+        draw.line((37, 76, 49, 88, 63, 63), fill=(48, 164, 154), width=4)
     resample = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
     scaled = template.resize((int(template.width * scale), int(template.height * scale)), resample)
     canvas.paste(scaled, (600, 220))
@@ -76,6 +85,25 @@ class LieDetectionMatcherTests(unittest.TestCase):
         result = self.matcher.analyze(screenshot_with_scaled_lie_detection(1.5))
 
         self.assertTrue(result.matched)
+
+    def test_detects_1080p_checked_lie_detection_template(self) -> None:
+        result = self.matcher.analyze(screenshot_with_scaled_lie_detection(0.8, checked=True))
+
+        self.assertTrue(result.matched)
+
+    def test_detects_lie_detection_between_manual_scale_points(self) -> None:
+        for scale in (0.81, 0.97, 1.23):
+            with self.subTest(scale=scale):
+                result = self.matcher.analyze(screenshot_with_scaled_lie_detection(scale, checked=True))
+
+                self.assertTrue(result.matched)
+
+    def test_generated_scale_candidates_do_not_leave_large_gaps(self) -> None:
+        scales = build_recaptcha_match_scales()
+
+        self.assertGreater(len(scales), 40)
+        max_gap = max(next_scale / scale for scale, next_scale in zip(scales, scales[1:]))
+        self.assertLessEqual(max_gap, RECAPTCHA_MATCH_SCALE_STEP_RATIO + 0.01)
 
     def test_maple_shop_like_ui_is_not_detected(self) -> None:
         result = self.matcher.analyze(maple_shop_like_screenshot())

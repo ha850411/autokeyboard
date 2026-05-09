@@ -80,41 +80,37 @@ RECAPTCHA_SMALL_CV_MATCH_THRESHOLD = 0.9
 RECAPTCHA_VERIFY_MEAN_THRESHOLD = 20.0
 RECAPTCHA_VERIFY_GOOD_PIXEL_THRESHOLD = 42.0
 RECAPTCHA_VERIFY_GOOD_PIXEL_RATIO = 0.88
+RECAPTCHA_MATCH_SCALE_MIN = 0.12
+RECAPTCHA_MATCH_SCALE_MAX = 2.0
+RECAPTCHA_MATCH_SCALE_STEP_RATIO = 1.035
 DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
 PROCESS_PER_MONITOR_DPI_AWARE = 2
-RECAPTCHA_MATCH_SCALES = (
-    0.12,
-    0.13,
-    0.14,
-    0.15,
-    0.16,
-    0.18,
-    0.2,
-    0.22,
-    0.24,
-    0.25,
-    0.26,
-    0.28,
-    0.3,
-    0.33,
-    0.35,
-    0.4,
-    0.45,
-    0.5,
-    0.6,
-    0.75,
-    0.85,
-    0.9,
-    1.0,
-    1.05,
-    1.15,
-    1.2,
-    1.35,
-    1.5,
-    1.65,
-    1.8,
-    2.0,
-)
+
+
+def build_recaptcha_match_scales(
+    *,
+    min_scale: float = RECAPTCHA_MATCH_SCALE_MIN,
+    max_scale: float = RECAPTCHA_MATCH_SCALE_MAX,
+    step_ratio: float = RECAPTCHA_MATCH_SCALE_STEP_RATIO,
+) -> tuple[float, ...]:
+    if min_scale <= 0 or max_scale < min_scale or step_ratio <= 1:
+        return ()
+
+    scales: list[float] = []
+    scale = min_scale
+    rounded_max_scale = round(max_scale, 3)
+    while scale <= max_scale:
+        rounded_scale = round(scale, 3)
+        if not scales or rounded_scale > scales[-1]:
+            scales.append(rounded_scale)
+        scale *= step_ratio
+
+    if not scales or scales[-1] < rounded_max_scale:
+        scales.append(rounded_max_scale)
+    return tuple(scales)
+
+
+RECAPTCHA_MATCH_SCALES = build_recaptcha_match_scales()
 RECAPTCHA_FOCUS_ROI = (0.06, 0.04, 0.94, 0.98)
 RECAPTCHA_FOCUS_STABLE_SECONDS = 0.3
 RECAPTCHA_ALLOWED_WINDOW_TITLES = ("MapleStory Worlds",)
@@ -1280,7 +1276,7 @@ class ImageTemplateMatcher:
         *,
         downsample: float = RECAPTCHA_MATCH_DOWNSAMPLE,
         threshold: float = RECAPTCHA_MATCH_THRESHOLD,
-        scales: tuple[float, ...] = RECAPTCHA_MATCH_SCALES,
+        scales: tuple[float, ...] | None = None,
     ) -> None:
         if Image is None or ImageChops is None or ImageStat is None:
             raise RuntimeError("缺少 Pillow，請先安裝 Pillow 才能讀取與比對圖片。")
@@ -1293,7 +1289,7 @@ class ImageTemplateMatcher:
         self._scales = scales
         self._resample = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
         self._template = Image.open(template_path).convert("RGB")
-        self._templates_by_downsample: dict[float, list[PreparedTemplate]] = {}
+        self._templates_by_downsample: dict[tuple[float, tuple[float, ...]], list[PreparedTemplate]] = {}
 
     def contains(self, screenshot) -> bool:
         return self.analyze(screenshot).matched
@@ -1311,7 +1307,8 @@ class ImageTemplateMatcher:
         if not self._has_recaptcha_palette(small_screenshot):
             return ImageMatchResult(matched=False, has_features=False)
 
-        templates = self._templates_for_downsample(downsample)
+        scales = self._scales_for_screenshot(screenshot)
+        templates = self._templates_for_downsample(downsample, scales)
 
         if cv2 is not None and np is not None:
             return ImageMatchResult(
@@ -1331,6 +1328,15 @@ class ImageTemplateMatcher:
             return 1.0
         return self._downsample
 
+    def _scales_for_screenshot(self, screenshot) -> tuple[float, ...]:
+        if self._scales is not None:
+            return self._scales
+
+        max_scale_by_width = screenshot.width / self._template.width
+        max_scale_by_height = screenshot.height / self._template.height
+        max_scale = min(RECAPTCHA_MATCH_SCALE_MAX, max_scale_by_width, max_scale_by_height)
+        return build_recaptcha_match_scales(max_scale=max_scale)
+
     def _has_recaptcha_palette(self, screenshot) -> bool:
         if np is None:
             return True
@@ -1349,11 +1355,11 @@ class ImageTemplateMatcher:
         min_blue_pixels = max(24, int(area * 0.00015))
         return int(bright_pixels.sum()) >= min_bright_pixels and int(button_blue_pixels.sum()) >= min_blue_pixels
 
-    def _templates_for_downsample(self, downsample: float) -> list[PreparedTemplate]:
-        key = round(downsample, 3)
+    def _templates_for_downsample(self, downsample: float, scales: tuple[float, ...]) -> list[PreparedTemplate]:
+        key = (round(downsample, 3), scales)
         templates = self._templates_by_downsample.get(key)
         if templates is None:
-            templates = self._prepare_templates(self._scales, downsample)
+            templates = self._prepare_templates(scales, downsample)
             self._templates_by_downsample[key] = templates
         return templates
 
