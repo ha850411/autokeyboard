@@ -187,20 +187,41 @@ class ConfigPersistenceTests(unittest.TestCase):
                 self.assertEqual(ak.load_recaptcha_monitor_settings(), ak.RecaptchaMonitorSettings())
 
                 ak.save_recaptcha_monitor_settings(
-                    ak.RecaptchaMonitorSettings(enabled=False, user_id="<@123456789>", only_maplestory_window=False)
+                    ak.RecaptchaMonitorSettings(
+                        enabled=False,
+                        recipient_name="羅總",
+                        only_maplestory_window=False,
+                    )
                 )
                 loaded = ak.load_recaptcha_monitor_settings()
+                saved_data = ak.json.loads(settings_path.read_text(encoding="utf-8"))
 
-                settings_path.write_text('{"enabled": true, "user_id": "abc987"}', encoding="utf-8")
+                legacy_recipient = ak.DISCORD_RECIPIENTS_BY_NAME["蔡董"]
+                settings_path.write_text(
+                    ak.json.dumps(
+                        {
+                            "enabled": True,
+                            "user_id": f"abc{legacy_recipient.user_id}",
+                            "webhook_url": legacy_recipient.webhook_url,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
                 legacy_loaded = ak.load_recaptcha_monitor_settings()
 
         self.assertEqual(
             loaded,
-            ak.RecaptchaMonitorSettings(enabled=False, user_id="123456789", only_maplestory_window=False),
+            ak.RecaptchaMonitorSettings(
+                enabled=False,
+                recipient_name="羅總",
+                only_maplestory_window=False,
+            ),
         )
+        self.assertEqual(saved_data, {"enabled": False, "recipient_name": "羅總", "only_maplestory_window": False})
         self.assertEqual(
             legacy_loaded,
-            ak.RecaptchaMonitorSettings(enabled=True, user_id="987", only_maplestory_window=True),
+            ak.RecaptchaMonitorSettings(enabled=True, recipient_name="蔡董", only_maplestory_window=True),
         )
 
     def test_recaptcha_monitor_settings_invalid_config_returns_default(self) -> None:
@@ -215,6 +236,12 @@ class ConfigPersistenceTests(unittest.TestCase):
 
     def test_normalize_discord_user_id_keeps_digits_only(self) -> None:
         self.assertEqual(ak.normalize_discord_user_id(" <@123-abc-456> "), "123456")
+
+    def test_normalize_discord_webhook_url_trims_whitespace_and_angle_brackets(self) -> None:
+        self.assertEqual(
+            ak.normalize_discord_webhook_url(" <https://discord.com/api/webhooks/abc/token> "),
+            "https://discord.com/api/webhooks/abc/token",
+        )
 
 
 class TimeFormattingTests(unittest.TestCase):
@@ -306,13 +333,55 @@ class RecaptchaMonitorTests(unittest.TestCase):
         monitor = ak.RecaptchaMonitor(event_queue)
 
         monitor.set_settings(
-            ak.RecaptchaMonitorSettings(enabled=True, user_id="<@123abc456>", only_maplestory_window=False)
+            ak.RecaptchaMonitorSettings(
+                enabled=True,
+                recipient_name=" 羅總 ",
+                only_maplestory_window=False,
+            )
         )
 
         self.assertEqual(
             monitor._settings_snapshot(),
-            ak.RecaptchaMonitorSettings(enabled=True, user_id="123456", only_maplestory_window=False),
+            ak.RecaptchaMonitorSettings(
+                enabled=True,
+                recipient_name="羅總",
+                only_maplestory_window=False,
+            ),
         )
+
+    def test_monitor_settings_snapshot_requires_selected_recipient(self) -> None:
+        event_queue: queue.Queue[tuple[str, str]] = queue.Queue()
+        monitor = ak.RecaptchaMonitor(event_queue)
+
+        monitor.set_settings(ak.RecaptchaMonitorSettings(enabled=True, recipient_name="不存在"))
+
+        self.assertEqual(
+            monitor._settings_snapshot(),
+            ak.RecaptchaMonitorSettings(enabled=True, recipient_name="", only_maplestory_window=True),
+        )
+
+    def test_post_discord_webhook_uses_configured_url(self) -> None:
+        event_queue: queue.Queue[tuple[str, str]] = queue.Queue()
+        monitor = ak.RecaptchaMonitor(event_queue)
+        webhook_url = "https://discord.com/api/webhooks/custom/token"
+
+        class FakeResponse:
+            status = 204
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+        with (
+            patch.object(monitor, "_screenshot_png_bytes", return_value=b"png-bytes"),
+            patch("autokeyboard.urllib.request.urlopen", return_value=FakeResponse()) as urlopen,
+        ):
+            monitor._post_discord_webhook(webhook_url, "123", object())
+
+        request = urlopen.call_args.args[0]
+        self.assertEqual(request.full_url, webhook_url)
 
     def test_discord_multipart_body_contains_payload_and_file(self) -> None:
         event_queue: queue.Queue[tuple[str, str]] = queue.Queue()

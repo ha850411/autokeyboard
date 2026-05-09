@@ -80,6 +80,8 @@ RECAPTCHA_SMALL_CV_MATCH_THRESHOLD = 0.9
 RECAPTCHA_VERIFY_MEAN_THRESHOLD = 20.0
 RECAPTCHA_VERIFY_GOOD_PIXEL_THRESHOLD = 42.0
 RECAPTCHA_VERIFY_GOOD_PIXEL_RATIO = 0.88
+DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
+PROCESS_PER_MONITOR_DPI_AWARE = 2
 RECAPTCHA_MATCH_SCALES = (
     0.12,
     0.13,
@@ -108,15 +110,14 @@ RECAPTCHA_MATCH_SCALES = (
     1.15,
     1.2,
     1.35,
+    1.5,
+    1.65,
+    1.8,
+    2.0,
 )
 RECAPTCHA_FOCUS_ROI = (0.06, 0.04, 0.94, 0.98)
 RECAPTCHA_FOCUS_STABLE_SECONDS = 0.3
 RECAPTCHA_ALLOWED_WINDOW_TITLES = ("MapleStory Worlds",)
-DISCORD_WEBHOOK_URL = (
-    "https://discord.com/api/webhooks/"
-    "1501796578107592814/"
-    "XFCFj0KZg0jF3wm2oVtrEiBVZBI6_mapRubg2mEp1hM7x_RKNtoMBtfx5X4CON2eLxUh"
-)
 DISCORD_NOTIFICATION_TEXT = "愣住！你被測謊啦"
 
 
@@ -126,6 +127,40 @@ if platform.system() == "Windows":
     user32.GetAsyncKeyState.restype = ctypes.c_short
 else:
     user32 = None
+
+
+def configure_process_dpi_awareness() -> None:
+    if platform.system() != "Windows":
+        return
+
+    windll = getattr(ctypes, "windll", None)
+    if windll is None:
+        return
+
+    try:
+        set_context = windll.user32.SetProcessDpiAwarenessContext
+        set_context.argtypes = (ctypes.c_void_p,)
+        set_context.restype = ctypes.c_bool
+        if set_context(ctypes.c_void_p(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)):
+            return
+    except (AttributeError, OSError):
+        pass
+
+    try:
+        set_awareness = windll.shcore.SetProcessDpiAwareness
+        set_awareness.argtypes = (ctypes.c_int,)
+        set_awareness.restype = ctypes.c_long
+        if set_awareness(PROCESS_PER_MONITOR_DPI_AWARE) == 0:
+            return
+    except (AttributeError, OSError):
+        pass
+
+    try:
+        set_dpi_aware = windll.user32.SetProcessDPIAware
+        set_dpi_aware.restype = ctypes.c_bool
+        set_dpi_aware()
+    except (AttributeError, OSError):
+        pass
 
 
 VK_BACK = 0x08
@@ -802,9 +837,46 @@ def save_scripts(scripts: list[Script]) -> None:
 
 
 @dataclass
+class DiscordRecipient:
+    name: str
+    user_id: str
+    webhook_url: str
+
+
+DISCORD_RECIPIENTS = (
+    DiscordRecipient(
+        name="客服",
+        user_id="383460422457753602",
+        webhook_url=(
+            "https://discord.com/api/webhooks/1502681017071308960/"
+            "Pd3QwbC3JKY3qy44HX8QMI9IShY30ujBIQYZZdlAIuq8tHbb9vGX8INiUQSjmyD4pi1p"
+        ),
+    ),
+    DiscordRecipient(
+        name="羅總",
+        user_id="446938994727714817",
+        webhook_url=(
+            "https://discord.com/api/webhooks/1502681053847097494/"
+            "It3RWUWICoqwycFtvDOh3g-u1fz5Rs_tp22IjYoeDSDSHfbJNK-dnLwq3TvXqi1wHJVp"
+        ),
+    ),
+    DiscordRecipient(
+        name="蔡董",
+        user_id="464337253880299520",
+        webhook_url=(
+            "https://discord.com/api/webhooks/1502679542790095020/"
+            "BZDzq_bLaKLFPTTutJ6PCgejMtSr-CgmQ2STgbJmfTRd5kEi0enhQ6xDjW_XYvXMaXkU"
+        ),
+    ),
+)
+DISCORD_RECIPIENTS_BY_NAME = {recipient.name: recipient for recipient in DISCORD_RECIPIENTS}
+DEFAULT_DISCORD_RECIPIENT_NAME = ""
+
+
+@dataclass
 class RecaptchaMonitorSettings:
     enabled: bool = True
-    user_id: str = ""
+    recipient_name: str = DEFAULT_DISCORD_RECIPIENT_NAME
     only_maplestory_window: bool = True
 
 
@@ -812,14 +884,50 @@ def normalize_discord_user_id(value: str) -> str:
     return "".join(character for character in value.strip() if character.isdigit())
 
 
+def normalize_discord_webhook_url(value: str) -> str:
+    return value.strip().strip("<>")
+
+
+def discord_recipient_names() -> tuple[str, ...]:
+    return tuple(recipient.name for recipient in DISCORD_RECIPIENTS)
+
+
+def discord_recipient_for_name(value: str) -> DiscordRecipient | None:
+    return DISCORD_RECIPIENTS_BY_NAME.get(value.strip())
+
+
+def normalized_discord_recipient_name(value: str) -> str:
+    recipient = discord_recipient_for_name(value)
+    return recipient.name if recipient is not None else ""
+
+
+def discord_recipient_for_legacy_settings(user_id: str, webhook_url: str) -> DiscordRecipient | None:
+    normalized_user_id = normalize_discord_user_id(user_id)
+    normalized_webhook_url = normalize_discord_webhook_url(webhook_url)
+    for recipient in DISCORD_RECIPIENTS:
+        if normalized_user_id and recipient.user_id == normalized_user_id:
+            return recipient
+        if normalized_webhook_url and recipient.webhook_url == normalized_webhook_url:
+            return recipient
+    return None
+
+
 def load_recaptcha_monitor_settings() -> RecaptchaMonitorSettings:
     try:
         if not MONITOR_CONFIG_PATH.exists():
             return RecaptchaMonitorSettings()
         data = json.loads(MONITOR_CONFIG_PATH.read_text(encoding="utf-8"))
+        recipient_name = str(data.get("recipient_name", ""))
+        if recipient_name:
+            recipient = discord_recipient_for_name(recipient_name)
+        else:
+            recipient = discord_recipient_for_legacy_settings(
+                str(data.get("user_id", "")),
+                str(data.get("webhook_url", "")),
+            )
         return RecaptchaMonitorSettings(
             enabled=bool(data.get("enabled", True)),
-            user_id=normalize_discord_user_id(str(data.get("user_id", ""))),
+            recipient_name=recipient.name if recipient is not None else "",
             only_maplestory_window=bool(data.get("only_maplestory_window", True)),
         )
     except Exception:
@@ -829,7 +937,7 @@ def load_recaptcha_monitor_settings() -> RecaptchaMonitorSettings:
 def save_recaptcha_monitor_settings(settings: RecaptchaMonitorSettings) -> None:
     data = {
         "enabled": bool(settings.enabled),
-        "user_id": normalize_discord_user_id(settings.user_id),
+        "recipient_name": normalized_discord_recipient_name(settings.recipient_name),
         "only_maplestory_window": bool(settings.only_maplestory_window),
     }
     MONITOR_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -1488,7 +1596,7 @@ class RecaptchaMonitor:
     def set_settings(self, settings: RecaptchaMonitorSettings) -> None:
         normalized = RecaptchaMonitorSettings(
             enabled=bool(settings.enabled),
-            user_id=normalize_discord_user_id(settings.user_id),
+            recipient_name=normalized_discord_recipient_name(settings.recipient_name),
             only_maplestory_window=bool(settings.only_maplestory_window),
         )
         with self._settings_lock:
@@ -1512,7 +1620,8 @@ class RecaptchaMonitor:
             started_at = time.monotonic()
             scan_interval = RECAPTCHA_SCAN_INTERVAL_SECONDS
             settings = self._settings_snapshot()
-            if settings.enabled and settings.user_id:
+            recipient = discord_recipient_for_name(settings.recipient_name)
+            if settings.enabled and recipient is not None:
                 try:
                     screenshot = capture.capture(only_allowed_window=settings.only_maplestory_window)
                     result = matcher.analyze(screenshot) if screenshot is not None else ImageMatchResult(
@@ -1523,7 +1632,7 @@ class RecaptchaMonitor:
                     if result.has_features:
                         scan_interval = RECAPTCHA_FEATURE_SCAN_INTERVAL_SECONDS
                     if matched and self._is_confirmed_match():
-                        self._notify_detected(settings.user_id, screenshot)
+                        self._notify_detected(recipient.webhook_url, recipient.user_id, screenshot)
                     elif not matched:
                         self._reset_match_confirmation()
                 except Exception as exc:
@@ -1549,15 +1658,15 @@ class RecaptchaMonitor:
         with self._settings_lock:
             return RecaptchaMonitorSettings(
                 enabled=self._settings.enabled,
-                user_id=self._settings.user_id,
+                recipient_name=self._settings.recipient_name,
                 only_maplestory_window=self._settings.only_maplestory_window,
             )
 
-    def _notify_detected(self, user_id: str, screenshot) -> None:
-        self._post_discord_webhook(user_id, screenshot)
+    def _notify_detected(self, webhook_url: str, user_id: str, screenshot) -> None:
+        self._post_discord_webhook(webhook_url, user_id, screenshot)
         self._publish("notified", "偵測到測謊，已通知 Discord 並附上截圖。")
 
-    def _post_discord_webhook(self, user_id: str, screenshot) -> None:
+    def _post_discord_webhook(self, webhook_url: str, user_id: str, screenshot) -> None:
         filename = f"recaptcha-detected-{int(time.time())}.png"
         payload = {
             "content": f"<@{user_id}> {DISCORD_NOTIFICATION_TEXT}",
@@ -1569,7 +1678,7 @@ class RecaptchaMonitor:
             filename=filename,
         )
         request = urllib.request.Request(
-            DISCORD_WEBHOOK_URL,
+            webhook_url,
             data=body,
             headers={
                 "Content-Type": content_type,
@@ -1935,7 +2044,9 @@ class AutoKeyboardApp:
         self.step_delay_ms_var = tk.StringVar(value="1,000")
         self.recaptcha_enabled_var = tk.BooleanVar(value=self.recaptcha_settings.enabled)
         self.recaptcha_maplestory_only_var = tk.BooleanVar(value=self.recaptcha_settings.only_maplestory_window)
-        self.recaptcha_user_id_var = tk.StringVar(value=self.recaptcha_settings.user_id)
+        self.recaptcha_recipient_name_var = tk.StringVar(value=self.recaptcha_settings.recipient_name)
+        self.recaptcha_bound_user_id_var = tk.StringVar(value="")
+        self.recaptcha_bound_webhook_var = tk.StringVar(value="")
         self.recaptcha_status_var = tk.StringVar(value="")
         self.banner_var = tk.StringVar(value="待命")
         self.status_var = tk.StringVar(value="準備就緒")
@@ -1943,6 +2054,7 @@ class AutoKeyboardApp:
         self._configure_style()
         self._build_ui()
         self._bind_auto_save()
+        self._refresh_recaptcha_binding_display()
         self.recaptcha_monitor.set_settings(self.recaptcha_settings)
         self.recaptcha_monitor.start()
         self._update_recaptcha_status_from_settings(saved=False)
@@ -2037,6 +2149,23 @@ class AutoKeyboardApp:
             insertcolor=colors["text"],
         )
         style.map("TEntry", bordercolor=[("focus", colors["primary"])])
+        style.configure(
+            "Recipient.TCombobox",
+            padding=(8, 6),
+            fieldbackground="#ffffff",
+            background="#ffffff",
+            foreground=colors["text"],
+            bordercolor=colors["input_border"],
+            lightcolor=colors["input_border"],
+            darkcolor=colors["input_border"],
+            arrowcolor=colors["primary"],
+        )
+        style.map(
+            "Recipient.TCombobox",
+            fieldbackground=[("readonly", "#ffffff")],
+            bordercolor=[("focus", colors["primary"])],
+            arrowcolor=[("active", colors["primary_hover"])],
+        )
 
         style.configure("TButton", padding=(12, 7), borderwidth=0, focusthickness=0, relief="flat")
         style.map(
@@ -2186,22 +2315,40 @@ class AutoKeyboardApp:
             text="只偵測楓之谷視窗",
             variable=self.recaptcha_maplestory_only_var,
         ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(0, 8))
-        ttk.Label(monitor_frame, text="User ID", style="Panel.TLabel").grid(
+        ttk.Label(monitor_frame, text="通知對象", style="Panel.TLabel").grid(
             row=3, column=0, sticky="w", padx=(0, 8)
         )
-        self.recaptcha_user_id_entry = RoundedEntry(
+        self.recaptcha_recipient_combo = ttk.Combobox(
             monitor_frame,
-            textvariable=self.recaptcha_user_id_var,
-            colors=self.colors,
-            width=18,
+            textvariable=self.recaptcha_recipient_name_var,
+            values=discord_recipient_names(),
+            state="readonly",
+            style="Recipient.TCombobox",
         )
-        self.recaptcha_user_id_entry.grid(row=3, column=1, sticky="ew")
+        self.recaptcha_recipient_combo.grid(row=3, column=1, sticky="ew")
+        ttk.Label(monitor_frame, text="綁定 User", style="Panel.TLabel").grid(
+            row=4, column=0, sticky="w", padx=(0, 8), pady=(8, 0)
+        )
+        ttk.Label(
+            monitor_frame,
+            textvariable=self.recaptcha_bound_user_id_var,
+            style="Small.TLabel",
+        ).grid(row=4, column=1, sticky="w", pady=(8, 0))
+        ttk.Label(monitor_frame, text="Webhook", style="Panel.TLabel").grid(
+            row=5, column=0, sticky="nw", padx=(0, 8), pady=(8, 0)
+        )
+        ttk.Label(
+            monitor_frame,
+            textvariable=self.recaptcha_bound_webhook_var,
+            style="Small.TLabel",
+            wraplength=240,
+        ).grid(row=5, column=1, sticky="ew", pady=(8, 0))
         ttk.Label(
             monitor_frame,
             textvariable=self.recaptcha_status_var,
             style="Small.TLabel",
             wraplength=240,
-        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
         right.columnconfigure(0, weight=1)
         right.rowconfigure(3, weight=1)
@@ -2823,7 +2970,11 @@ class AutoKeyboardApp:
             variable.trace_add("write", self._schedule_auto_save_script_settings)
         for variable in (self.step_key_mode_var, self.step_key_var, self.step_delay_ms_var):
             variable.trace_add("write", self._schedule_auto_save_selected_step)
-        for variable in (self.recaptcha_enabled_var, self.recaptcha_maplestory_only_var, self.recaptcha_user_id_var):
+        for variable in (
+            self.recaptcha_enabled_var,
+            self.recaptcha_maplestory_only_var,
+            self.recaptcha_recipient_name_var,
+        ):
             variable.trace_add("write", self._schedule_recaptcha_settings_save)
 
     def _schedule_auto_save_script_settings(self, *_args) -> None:
@@ -2880,20 +3031,21 @@ class AutoKeyboardApp:
 
     def _save_recaptcha_settings_from_ui(self) -> None:
         self._recaptcha_save_after_id = None
-        user_id = normalize_discord_user_id(self.recaptcha_user_id_var.get())
-        if user_id != self.recaptcha_user_id_var.get().strip():
+        recipient_name = normalized_discord_recipient_name(self.recaptcha_recipient_name_var.get())
+        if recipient_name != self.recaptcha_recipient_name_var.get().strip():
             self._loading_recaptcha_settings = True
             try:
-                self.recaptcha_user_id_var.set(user_id)
+                self.recaptcha_recipient_name_var.set(recipient_name)
             finally:
                 self._loading_recaptcha_settings = False
 
         settings = RecaptchaMonitorSettings(
             enabled=bool(self.recaptcha_enabled_var.get()),
-            user_id=user_id,
+            recipient_name=recipient_name,
             only_maplestory_window=bool(self.recaptcha_maplestory_only_var.get()),
         )
         self.recaptcha_settings = settings
+        self._refresh_recaptcha_binding_display()
         try:
             save_recaptcha_monitor_settings(settings)
         except OSError as exc:
@@ -2903,11 +3055,20 @@ class AutoKeyboardApp:
         self.recaptcha_monitor.set_settings(settings)
         self._update_recaptcha_status_from_settings(saved=True)
 
+    def _refresh_recaptcha_binding_display(self) -> None:
+        recipient = discord_recipient_for_name(self.recaptcha_recipient_name_var.get())
+        if recipient is None:
+            self.recaptcha_bound_user_id_var.set("尚未選擇")
+            self.recaptcha_bound_webhook_var.set("尚未選擇")
+            return
+        self.recaptcha_bound_user_id_var.set(f"{recipient.name} / {recipient.user_id}")
+        self.recaptcha_bound_webhook_var.set(recipient.webhook_url)
+
     def _update_recaptcha_status_from_settings(self, *, saved: bool) -> None:
         if not self.recaptcha_enabled_var.get():
             message = "偵測已關閉。"
-        elif not normalize_discord_user_id(self.recaptcha_user_id_var.get()):
-            message = "請輸入 Discord User ID 後開始偵測。"
+        elif discord_recipient_for_name(self.recaptcha_recipient_name_var.get()) is None:
+            message = "請先選擇通知對象，才會開始測謊偵測。"
         else:
             scope = "只偵測楓之谷視窗" if self.recaptcha_maplestory_only_var.get() else "偵測目前 focus 視窗"
             message = f"{scope}中央區域；連續命中才通知。"
@@ -3864,6 +4025,7 @@ def main() -> int:
     if "--self-test" in sys.argv:
         return run_self_test()
 
+    configure_process_dpi_awareness()
     root = tk.Tk()
     try:
         AutoKeyboardApp(root)

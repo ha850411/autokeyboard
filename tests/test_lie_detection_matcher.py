@@ -72,6 +72,11 @@ class LieDetectionMatcherTests(unittest.TestCase):
 
         self.assertTrue(result.matched)
 
+    def test_detects_high_dpi_scaled_lie_detection_template(self) -> None:
+        result = self.matcher.analyze(screenshot_with_scaled_lie_detection(1.5))
+
+        self.assertTrue(result.matched)
+
     def test_maple_shop_like_ui_is_not_detected(self) -> None:
         result = self.matcher.analyze(maple_shop_like_screenshot())
 
