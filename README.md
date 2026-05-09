@@ -67,6 +67,23 @@
 
 如果要對系統管理員權限的程式送出按鍵，請用系統管理員身分啟動此工具。
 
+## 測試
+
+測謊偵測的 regression test 可執行：
+
+```powershell
+python -m unittest discover -s tests
+```
+
+目前測試包含按鍵解析、腳本序列化、設定檔讀寫、測謊偵測設定、腳本執行器與測謊圖片情境。
+
+測試情境圖片可放在：
+
+- `tests/fixtures/lie_detection_false_positives/`：不應該被偵測為測謊的截圖。
+- `tests/fixtures/lie_detection_true_positives/`：必須被偵測為測謊的截圖。
+
+測試會掃描這兩個資料夾與其子資料夾內的 `.png`、`.jpg`、`.jpeg`、`.bmp`、`.webp`。
+
 ## 打包 exe
 
 已安裝 PyInstaller 後可執行：

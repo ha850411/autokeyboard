@@ -31,3 +31,5 @@ installer: exe
 
 clean:
 	$(RM_BUILD)
+test:
+	"$(PYTHON)" -m unittest discover -s tests

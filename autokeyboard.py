@@ -80,7 +80,7 @@ RECAPTCHA_SMALL_CV_MATCH_THRESHOLD = 0.9
 RECAPTCHA_VERIFY_MEAN_THRESHOLD = 20.0
 RECAPTCHA_VERIFY_GOOD_PIXEL_THRESHOLD = 42.0
 RECAPTCHA_VERIFY_GOOD_PIXEL_RATIO = 0.88
-RECAPTCHA_MATCH_SCALES = (0.12, 0.13, 0.14, 0.15, 0.16, 0.18, 0.2, 0.22, 0.24, 0.25, 0.26, 0.28, 0.3, 0.33, 0.35, 0.4, 0.45, 0.5, 0.6, 0.75, 0.85, 0.9, 1.0, 1.05, 1.15, 1.2, 1.35)
+RECAPTCHA_MATCH_SCALES = (0.45, 0.5, 0.6, 0.75, 0.85, 0.9, 1.0, 1.05, 1.15, 1.2, 1.35)
 RECAPTCHA_FOCUS_ROI = (0.06, 0.04, 0.94, 0.98)
 RECAPTCHA_FOCUS_STABLE_SECONDS = 0.3
 RECAPTCHA_ALLOWED_WINDOW_TITLES = ("MapleStory Worlds",)
@@ -777,6 +777,7 @@ def save_scripts(scripts: list[Script]) -> None:
 class RecaptchaMonitorSettings:
     enabled: bool = True
     user_id: str = ""
+    only_maplestory_window: bool = True
 
 
 def normalize_discord_user_id(value: str) -> str:
@@ -791,6 +792,7 @@ def load_recaptcha_monitor_settings() -> RecaptchaMonitorSettings:
         return RecaptchaMonitorSettings(
             enabled=bool(data.get("enabled", True)),
             user_id=normalize_discord_user_id(str(data.get("user_id", ""))),
+            only_maplestory_window=bool(data.get("only_maplestory_window", True)),
         )
     except Exception:
         return RecaptchaMonitorSettings()
@@ -800,6 +802,7 @@ def save_recaptcha_monitor_settings(settings: RecaptchaMonitorSettings) -> None:
     data = {
         "enabled": bool(settings.enabled),
         "user_id": normalize_discord_user_id(settings.user_id),
+        "only_maplestory_window": bool(settings.only_maplestory_window),
     }
     MONITOR_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     MONITOR_CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -967,6 +970,8 @@ class PreparedTemplate:
     image: object
     samples: list[tuple[int, int, int, int, int]]
     gray: object | None = None
+    important_mask: object | None = None
+    important_samples: list[tuple[int, int, int, int, int]] = field(default_factory=list)
     scale: float = 1.0
 
 
@@ -1003,7 +1008,7 @@ class FocusedWindowCapture:
         user32.GetMonitorInfoW.argtypes = (ctypes.c_void_p, ctypes.POINTER(MONITORINFO))
         user32.GetMonitorInfoW.restype = ctypes.c_bool
 
-    def capture(self):
+    def capture(self, *, only_allowed_window: bool = True):
         hwnd = user32.GetForegroundWindow()
         if not hwnd or not user32.IsWindowVisible(hwnd):
             self._reset_focus_stability()
@@ -1012,7 +1017,7 @@ class FocusedWindowCapture:
         if self._excluded_pid is not None and process_id == self._excluded_pid:
             self._reset_focus_stability()
             return None
-        if not self._is_allowed_window(hwnd):
+        if only_allowed_window and not self._is_allowed_window(hwnd):
             self._reset_focus_stability()
             return None
 
@@ -1223,13 +1228,36 @@ class ImageTemplateMatcher:
             height = max(1, int(self._template.height * scale * downsample))
             image = self._template.resize((width, height), self._resample)
             gray = None
+            important_mask = None
             samples: list[tuple[int, int, int, int, int]] = []
+            important_samples: list[tuple[int, int, int, int, int]] = []
             if cv2 is not None and np is not None:
                 gray = np.asarray(image.convert("L"))
+                important_mask = self._important_pixel_mask(image)
             else:
                 samples = self._sample_points(image)
-            templates.append(PreparedTemplate(image=image, samples=samples, gray=gray, scale=scale))
+                important_samples = self._important_samples(samples)
+            templates.append(
+                PreparedTemplate(
+                    image=image,
+                    samples=samples,
+                    gray=gray,
+                    important_mask=important_mask,
+                    important_samples=important_samples,
+                    scale=scale,
+                )
+            )
         return templates
+
+    def _important_pixel_mask(self, image):
+        pixels = np.asarray(image)
+        return (pixels[:, :, 0] < 245) | (pixels[:, :, 1] < 245) | (pixels[:, :, 2] < 245)
+
+    def _important_samples(
+        self,
+        samples: list[tuple[int, int, int, int, int]],
+    ) -> list[tuple[int, int, int, int, int]]:
+        return [sample for sample in samples if sample[2] < 245 or sample[3] < 245 or sample[4] < 245]
 
     def _contains_with_cv(self, screenshot, templates: list[PreparedTemplate]) -> bool:
         screenshot_gray = np.asarray(screenshot.convert("L"))
@@ -1272,7 +1300,9 @@ class ImageTemplateMatcher:
             mean = float(per_pixel.mean())
             mean_threshold, good_pixel_threshold, good_pixel_ratio = self._verify_thresholds(template)
             good_ratio = float((per_pixel <= good_pixel_threshold).mean())
-            return mean <= mean_threshold and good_ratio >= good_pixel_ratio
+            if mean > mean_threshold or good_ratio < good_pixel_ratio:
+                return False
+            return self._verify_important_pixels(per_pixel, template)
 
         diff = ImageChops.difference(crop, template_image)
         mean = sum(ImageStat.Stat(diff).mean) / 3
@@ -1288,6 +1318,52 @@ class ImageTemplateMatcher:
             RECAPTCHA_VERIFY_MEAN_THRESHOLD,
             RECAPTCHA_VERIFY_GOOD_PIXEL_THRESHOLD,
             RECAPTCHA_VERIFY_GOOD_PIXEL_RATIO,
+        )
+
+    def _verify_important_pixels(self, per_pixel, template: PreparedTemplate) -> bool:
+        important_mask = template.important_mask
+        if important_mask is None:
+            return True
+
+        important_count = int(important_mask.sum())
+        if important_count < 8:
+            return True
+
+        important_errors = per_pixel[important_mask]
+        mean_threshold, good_pixel_threshold, good_pixel_ratio = self._verify_thresholds(template)
+        important_mean_threshold = mean_threshold * 1.4
+        important_good_ratio = max(0.62, good_pixel_ratio - 0.1)
+        return (
+            float(important_errors.mean()) <= important_mean_threshold
+            and float((important_errors <= good_pixel_threshold).mean()) >= important_good_ratio
+        )
+
+    def _verify_important_samples(
+        self,
+        screenshot_pixels,
+        template: PreparedTemplate,
+        origin_x: int,
+        origin_y: int,
+    ) -> bool:
+        if not template.important_samples:
+            return True
+
+        mean_threshold, good_pixel_threshold, good_pixel_ratio = self._verify_thresholds(template)
+        important_mean_threshold = mean_threshold * 1.4
+        important_good_ratio = max(0.62, good_pixel_ratio - 0.1)
+        total_error = 0.0
+        good_count = 0
+        for sample_x, sample_y, red, green, blue in template.important_samples:
+            pixel_red, pixel_green, pixel_blue = screenshot_pixels[origin_x + sample_x, origin_y + sample_y]
+            error = (abs(pixel_red - red) + abs(pixel_green - green) + abs(pixel_blue - blue)) / 3
+            total_error += error
+            if error <= good_pixel_threshold:
+                good_count += 1
+
+        sample_count = len(template.important_samples)
+        return (
+            total_error / sample_count <= important_mean_threshold
+            and good_count / sample_count >= important_good_ratio
         )
 
     def _sample_points(self, image) -> list[tuple[int, int, int, int, int]]:
@@ -1354,7 +1430,10 @@ class ImageTemplateMatcher:
                     crop = screenshot.crop((x, y, x + template_image.width, y + template_image.height))
                     diff = ImageChops.difference(crop, template_image)
                     mean = sum(ImageStat.Stat(diff).mean) / 3
-                    if mean <= max(self._threshold, mean_threshold):
+                    if (
+                        mean <= max(self._threshold, mean_threshold)
+                        and self._verify_important_samples(screenshot_pixels, template, x, y)
+                    ):
                         return True
 
         return False
@@ -1382,6 +1461,7 @@ class RecaptchaMonitor:
         normalized = RecaptchaMonitorSettings(
             enabled=bool(settings.enabled),
             user_id=normalize_discord_user_id(settings.user_id),
+            only_maplestory_window=bool(settings.only_maplestory_window),
         )
         with self._settings_lock:
             self._settings = normalized
@@ -1396,17 +1476,17 @@ class RecaptchaMonitor:
             capture = FocusedWindowCapture(excluded_pid=self._excluded_pid)
             matcher = ImageTemplateMatcher(RECAPTCHA_TEMPLATE_PATH)
         except Exception as exc:
-            self._publish("error", f"reCAPTCHA 偵測無法啟動：{exc}")
+            self._publish("error", f"測謊偵測無法啟動：{exc}")
             return
 
-        self._publish("ready", "reCAPTCHA 偵測已啟動。")
+        self._publish("ready", "測謊偵測已啟動。")
         while not self._stop_event.is_set():
             started_at = time.monotonic()
             scan_interval = RECAPTCHA_SCAN_INTERVAL_SECONDS
             settings = self._settings_snapshot()
             if settings.enabled and settings.user_id:
                 try:
-                    screenshot = capture.capture()
+                    screenshot = capture.capture(only_allowed_window=settings.only_maplestory_window)
                     result = matcher.analyze(screenshot) if screenshot is not None else ImageMatchResult(
                         matched=False,
                         has_features=False,
@@ -1419,7 +1499,7 @@ class RecaptchaMonitor:
                     elif not matched:
                         self._reset_match_confirmation()
                 except Exception as exc:
-                    self._publish_error(f"reCAPTCHA 偵測錯誤：{exc}")
+                    self._publish_error(f"測謊偵測錯誤：{exc}")
 
             else:
                 self._reset_match_confirmation()
@@ -1442,11 +1522,12 @@ class RecaptchaMonitor:
             return RecaptchaMonitorSettings(
                 enabled=self._settings.enabled,
                 user_id=self._settings.user_id,
+                only_maplestory_window=self._settings.only_maplestory_window,
             )
 
     def _notify_detected(self, user_id: str, screenshot) -> None:
         self._post_discord_webhook(user_id, screenshot)
-        self._publish("notified", "偵測到 reCAPTCHA，已通知 Discord 並附上截圖。")
+        self._publish("notified", "偵測到測謊，已通知 Discord 並附上截圖。")
 
     def _post_discord_webhook(self, user_id: str, screenshot) -> None:
         filename = f"recaptcha-detected-{int(time.time())}.png"
@@ -1825,6 +1906,7 @@ class AutoKeyboardApp:
         self.step_key_var = tk.StringVar(value="SPACE")
         self.step_delay_ms_var = tk.StringVar(value="1,000")
         self.recaptcha_enabled_var = tk.BooleanVar(value=self.recaptcha_settings.enabled)
+        self.recaptcha_maplestory_only_var = tk.BooleanVar(value=self.recaptcha_settings.only_maplestory_window)
         self.recaptcha_user_id_var = tk.StringVar(value=self.recaptcha_settings.user_id)
         self.recaptcha_status_var = tk.StringVar(value="")
         self.banner_var = tk.StringVar(value="待命")
@@ -2063,16 +2145,21 @@ class AutoKeyboardApp:
         monitor_frame.grid(row=4, column=0, sticky="ew")
         monitor_frame.columnconfigure(1, weight=1)
 
-        ttk.Label(monitor_frame, text="reCAPTCHA 通知", style="Title.TLabel").grid(
+        ttk.Label(monitor_frame, text="測謊偵測", style="Title.TLabel").grid(
             row=0, column=0, columnspan=2, sticky="w", pady=(0, 8)
         )
         ttk.Checkbutton(
             monitor_frame,
-            text="每秒檢查 focus 視窗",
+            text="開啟測謊偵測",
             variable=self.recaptcha_enabled_var,
         ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        ttk.Checkbutton(
+            monitor_frame,
+            text="只偵測楓之谷視窗",
+            variable=self.recaptcha_maplestory_only_var,
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(0, 8))
         ttk.Label(monitor_frame, text="User ID", style="Panel.TLabel").grid(
-            row=2, column=0, sticky="w", padx=(0, 8)
+            row=3, column=0, sticky="w", padx=(0, 8)
         )
         self.recaptcha_user_id_entry = RoundedEntry(
             monitor_frame,
@@ -2080,13 +2167,13 @@ class AutoKeyboardApp:
             colors=self.colors,
             width=18,
         )
-        self.recaptcha_user_id_entry.grid(row=2, column=1, sticky="ew")
+        self.recaptcha_user_id_entry.grid(row=3, column=1, sticky="ew")
         ttk.Label(
             monitor_frame,
             textvariable=self.recaptcha_status_var,
             style="Small.TLabel",
             wraplength=240,
-        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
         right.columnconfigure(0, weight=1)
         right.rowconfigure(3, weight=1)
@@ -2708,7 +2795,7 @@ class AutoKeyboardApp:
             variable.trace_add("write", self._schedule_auto_save_script_settings)
         for variable in (self.step_key_mode_var, self.step_key_var, self.step_delay_ms_var):
             variable.trace_add("write", self._schedule_auto_save_selected_step)
-        for variable in (self.recaptcha_enabled_var, self.recaptcha_user_id_var):
+        for variable in (self.recaptcha_enabled_var, self.recaptcha_maplestory_only_var, self.recaptcha_user_id_var):
             variable.trace_add("write", self._schedule_recaptcha_settings_save)
 
     def _schedule_auto_save_script_settings(self, *_args) -> None:
@@ -2776,12 +2863,13 @@ class AutoKeyboardApp:
         settings = RecaptchaMonitorSettings(
             enabled=bool(self.recaptcha_enabled_var.get()),
             user_id=user_id,
+            only_maplestory_window=bool(self.recaptcha_maplestory_only_var.get()),
         )
         self.recaptcha_settings = settings
         try:
             save_recaptcha_monitor_settings(settings)
         except OSError as exc:
-            self.recaptcha_status_var.set(f"儲存 reCAPTCHA 設定失敗：{exc}")
+            self.recaptcha_status_var.set(f"儲存測謊偵測設定失敗：{exc}")
             return
 
         self.recaptcha_monitor.set_settings(settings)
@@ -2793,7 +2881,8 @@ class AutoKeyboardApp:
         elif not normalize_discord_user_id(self.recaptcha_user_id_var.get()):
             message = "請輸入 Discord User ID 後開始偵測。"
         else:
-            message = "偵測 focus 視窗中央區域；連續 3 秒高精度命中才通知。60 秒最多通知 10 次。"
+            scope = "只偵測楓之谷視窗" if self.recaptcha_maplestory_only_var.get() else "偵測目前 focus 視窗"
+            message = f"{scope}中央區域；連續命中才通知。"
 
         if saved:
             message = f"{message} 已儲存。"
