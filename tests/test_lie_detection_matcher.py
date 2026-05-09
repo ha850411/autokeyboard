@@ -46,6 +46,15 @@ def maple_shop_like_screenshot() -> Image.Image:
     return image
 
 
+def screenshot_with_scaled_lie_detection(scale: float) -> Image.Image:
+    canvas = Image.new("RGB", (1366, 768), (0, 0, 0))
+    template = Image.open(RECAPTCHA_TEMPLATE_PATH).convert("RGB")
+    resample = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
+    scaled = template.resize((int(template.width * scale), int(template.height * scale)), resample)
+    canvas.paste(scaled, (600, 220))
+    return canvas
+
+
 class LieDetectionMatcherTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -55,6 +64,11 @@ class LieDetectionMatcherTests(unittest.TestCase):
         image = Image.open(RECAPTCHA_TEMPLATE_PATH).convert("RGB")
 
         result = self.matcher.analyze(image)
+
+        self.assertTrue(result.matched)
+
+    def test_detects_small_in_game_lie_detection_template(self) -> None:
+        result = self.matcher.analyze(screenshot_with_scaled_lie_detection(0.3))
 
         self.assertTrue(result.matched)
 

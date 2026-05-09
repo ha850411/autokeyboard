@@ -80,7 +80,35 @@ RECAPTCHA_SMALL_CV_MATCH_THRESHOLD = 0.9
 RECAPTCHA_VERIFY_MEAN_THRESHOLD = 20.0
 RECAPTCHA_VERIFY_GOOD_PIXEL_THRESHOLD = 42.0
 RECAPTCHA_VERIFY_GOOD_PIXEL_RATIO = 0.88
-RECAPTCHA_MATCH_SCALES = (0.45, 0.5, 0.6, 0.75, 0.85, 0.9, 1.0, 1.05, 1.15, 1.2, 1.35)
+RECAPTCHA_MATCH_SCALES = (
+    0.12,
+    0.13,
+    0.14,
+    0.15,
+    0.16,
+    0.18,
+    0.2,
+    0.22,
+    0.24,
+    0.25,
+    0.26,
+    0.28,
+    0.3,
+    0.33,
+    0.35,
+    0.4,
+    0.45,
+    0.5,
+    0.6,
+    0.75,
+    0.85,
+    0.9,
+    1.0,
+    1.05,
+    1.15,
+    1.2,
+    1.35,
+)
 RECAPTCHA_FOCUS_ROI = (0.06, 0.04, 0.94, 0.98)
 RECAPTCHA_FOCUS_STABLE_SECONDS = 0.3
 RECAPTCHA_ALLOWED_WINDOW_TITLES = ("MapleStory Worlds",)
