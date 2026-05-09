@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ctypes
+import io
 import json
 import os
 import platform
@@ -14,7 +15,6 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
@@ -70,12 +70,7 @@ MONITOR_CONFIG_PATH = user_data_directory() / MONITOR_CONFIG_FILENAME
 RECAPTCHA_TEMPLATE_PATH = resource_path("assets/check/recaptcha.jpg")
 RECAPTCHA_SCAN_INTERVAL_SECONDS = 0.5
 RECAPTCHA_FEATURE_SCAN_INTERVAL_SECONDS = 0.33
-RECAPTCHA_NOTIFY_WINDOW_SECONDS = 60.0
-RECAPTCHA_NOTIFY_LIMIT = 60
-RECAPTCHA_REPEAT_NOTIFY_SECONDS = 1.0
-RECAPTCHA_CONFIRM_SECONDS = 2.0
-RECAPTCHA_CONFIRM_MAX_GAP_SECONDS = 1.6
-RECAPTCHA_MATCH_MISS_GRACE_SECONDS = 0.85
+RECAPTCHA_CONFIRM_SECONDS = 1.0
 RECAPTCHA_MATCH_DOWNSAMPLE = 0.5
 RECAPTCHA_FULL_RES_MAX_PIXELS = 1_000_000
 RECAPTCHA_MATCH_THRESHOLD = 22.0
@@ -88,6 +83,7 @@ RECAPTCHA_VERIFY_GOOD_PIXEL_RATIO = 0.88
 RECAPTCHA_MATCH_SCALES = (0.12, 0.13, 0.14, 0.15, 0.16, 0.18, 0.2, 0.22, 0.24, 0.25, 0.26, 0.28, 0.3, 0.33, 0.35, 0.4, 0.45, 0.5, 0.6, 0.75, 0.85, 0.9, 1.0, 1.05, 1.15, 1.2, 1.35)
 RECAPTCHA_FOCUS_ROI = (0.06, 0.04, 0.94, 0.98)
 RECAPTCHA_FOCUS_STABLE_SECONDS = 0.3
+RECAPTCHA_ALLOWED_WINDOW_TITLES = ("MapleStory Worlds",)
 DISCORD_WEBHOOK_URL = (
     "https://discord.com/api/webhooks/"
     "1501796578107592814/"
@@ -994,6 +990,10 @@ class FocusedWindowCapture:
         user32.GetForegroundWindow.restype = ctypes.c_void_p
         user32.GetWindowRect.argtypes = (ctypes.c_void_p, ctypes.POINTER(RECT))
         user32.GetWindowRect.restype = ctypes.c_bool
+        user32.GetWindowTextLengthW.argtypes = (ctypes.c_void_p,)
+        user32.GetWindowTextLengthW.restype = ctypes.c_int
+        user32.GetWindowTextW.argtypes = (ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int)
+        user32.GetWindowTextW.restype = ctypes.c_int
         user32.GetWindowThreadProcessId.argtypes = (ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong))
         user32.GetWindowThreadProcessId.restype = ctypes.c_ulong
         user32.IsWindowVisible.argtypes = (ctypes.c_void_p,)
@@ -1006,9 +1006,14 @@ class FocusedWindowCapture:
     def capture(self):
         hwnd = user32.GetForegroundWindow()
         if not hwnd or not user32.IsWindowVisible(hwnd):
+            self._reset_focus_stability()
             return None
         process_id = self._window_process_id(hwnd)
         if self._excluded_pid is not None and process_id == self._excluded_pid:
+            self._reset_focus_stability()
+            return None
+        if not self._is_allowed_window(hwnd):
+            self._reset_focus_stability()
             return None
 
         window_bbox = self._window_bbox(hwnd)
@@ -1024,6 +1029,24 @@ class FocusedWindowCapture:
             return None
         window_bbox = self._center_roi_bbox(window_bbox)
         return self._grab_bbox(window_bbox)
+
+    def _is_allowed_window(self, hwnd: int) -> bool:
+        if not RECAPTCHA_ALLOWED_WINDOW_TITLES:
+            return True
+        title = self._window_title(hwnd).casefold()
+        return any(token.casefold() in title for token in RECAPTCHA_ALLOWED_WINDOW_TITLES)
+
+    def _window_title(self, hwnd: int) -> str:
+        length = user32.GetWindowTextLengthW(hwnd)
+        if length <= 0:
+            return ""
+        buffer = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(hwnd, buffer, length + 1)
+        return buffer.value
+
+    def _reset_focus_stability(self) -> None:
+        self._last_signature = None
+        self._last_signature_at = 0.0
 
     def _window_process_id(self, hwnd: int) -> int | None:
         pid = ctypes.c_ulong()
@@ -1345,14 +1368,9 @@ class RecaptchaMonitor:
         self._settings_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
-        self._notification_times: deque[float] = deque()
         self._last_error = ""
         self._last_error_at = 0.0
-        self._last_rate_limited_at = 0.0
         self._match_started_at: float | None = None
-        self._last_match_at: float | None = None
-        self._match_confirmed = False
-        self._last_match_notification_at: float | None = None
 
     def start(self) -> None:
         if self._thread is not None:
@@ -1397,9 +1415,9 @@ class RecaptchaMonitor:
                     if result.has_features:
                         scan_interval = RECAPTCHA_FEATURE_SCAN_INTERVAL_SECONDS
                     if matched and self._is_confirmed_match():
-                        self._notify_match_if_due(settings.user_id)
+                        self._notify_detected(settings.user_id, screenshot)
                     elif not matched:
-                        self._mark_match_missing()
+                        self._reset_match_confirmation()
                 except Exception as exc:
                     self._publish_error(f"reCAPTCHA 偵測錯誤：{exc}")
 
@@ -1411,29 +1429,13 @@ class RecaptchaMonitor:
 
     def _is_confirmed_match(self) -> bool:
         now = time.monotonic()
-        if self._last_match_at is None or now - self._last_match_at > RECAPTCHA_CONFIRM_MAX_GAP_SECONDS:
+        if self._match_started_at is None:
             self._match_started_at = now
-            self._match_confirmed = False
-        elif self._match_started_at is None:
-            self._match_started_at = now
-
-        self._last_match_at = now
-        if not self._match_confirmed and now - self._match_started_at >= RECAPTCHA_CONFIRM_SECONDS:
-            self._match_confirmed = True
-        return self._match_confirmed
-
-    def _mark_match_missing(self) -> None:
-        if self._last_match_at is None:
-            self._reset_match_confirmation()
-            return
-        if time.monotonic() - self._last_match_at >= RECAPTCHA_MATCH_MISS_GRACE_SECONDS:
-            self._reset_match_confirmation()
+            return False
+        return now - self._match_started_at >= RECAPTCHA_CONFIRM_SECONDS
 
     def _reset_match_confirmation(self) -> None:
         self._match_started_at = None
-        self._last_match_at = None
-        self._match_confirmed = False
-        self._last_match_notification_at = None
 
     def _settings_snapshot(self) -> RecaptchaMonitorSettings:
         with self._settings_lock:
@@ -1442,43 +1444,26 @@ class RecaptchaMonitor:
                 user_id=self._settings.user_id,
             )
 
-    def _notify_match_if_due(self, user_id: str) -> None:
-        now = time.monotonic()
-        if (
-            self._last_match_notification_at is not None
-            and now - self._last_match_notification_at < RECAPTCHA_REPEAT_NOTIFY_SECONDS
-        ):
-            return
+    def _notify_detected(self, user_id: str, screenshot) -> None:
+        self._post_discord_webhook(user_id, screenshot)
+        self._publish("notified", "偵測到 reCAPTCHA，已通知 Discord 並附上截圖。")
 
-        if self._notify_if_allowed(user_id):
-            self._last_match_notification_at = now
-
-    def _notify_if_allowed(self, user_id: str) -> bool:
-        now = time.monotonic()
-        while self._notification_times and now - self._notification_times[0] >= RECAPTCHA_NOTIFY_WINDOW_SECONDS:
-            self._notification_times.popleft()
-
-        if len(self._notification_times) >= RECAPTCHA_NOTIFY_LIMIT:
-            if now - self._last_rate_limited_at >= 10:
-                self._last_rate_limited_at = now
-                self._publish("rate_limited", "已達 Discord 通知上限，暫停送出。")
-            return False
-
-        self._notification_times.append(now)
-        self._post_discord_webhook(user_id)
-        self._publish("notified", "偵測到 reCAPTCHA，已通知 Discord。")
-        return True
-
-    def _post_discord_webhook(self, user_id: str) -> None:
+    def _post_discord_webhook(self, user_id: str, screenshot) -> None:
+        filename = f"recaptcha-detected-{int(time.time())}.png"
         payload = {
             "content": f"<@{user_id}> {DISCORD_NOTIFICATION_TEXT}",
             "allowed_mentions": {"users": [user_id]},
         }
+        body, content_type = self._discord_multipart_body(
+            payload=payload,
+            screenshot_bytes=self._screenshot_png_bytes(screenshot),
+            filename=filename,
+        )
         request = urllib.request.Request(
             DISCORD_WEBHOOK_URL,
-            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            data=body,
             headers={
-                "Content-Type": "application/json",
+                "Content-Type": content_type,
                 "User-Agent": f"{APP_NAME}/1.0",
             },
             method="POST",
@@ -1490,6 +1475,42 @@ class RecaptchaMonitor:
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[:200]
             raise RuntimeError(f"Discord webhook 回應 HTTP {exc.code}: {detail}") from exc
+
+    def _screenshot_png_bytes(self, screenshot) -> bytes:
+        output = io.BytesIO()
+        screenshot.save(output, format="PNG")
+        return output.getvalue()
+
+    def _discord_multipart_body(
+        self,
+        *,
+        payload: dict,
+        screenshot_bytes: bytes,
+        filename: str,
+    ) -> tuple[bytes, str]:
+        boundary = f"----{APP_NAME}{uuid.uuid4().hex}"
+        body = bytearray()
+
+        def add_line(line: str) -> None:
+            body.extend(line.encode("utf-8"))
+            body.extend(b"\r\n")
+
+        add_line(f"--{boundary}")
+        add_line('Content-Disposition: form-data; name="payload_json"')
+        add_line("Content-Type: application/json; charset=utf-8")
+        add_line("")
+        body.extend(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+        body.extend(b"\r\n")
+
+        add_line(f"--{boundary}")
+        add_line(f'Content-Disposition: form-data; name="files[0]"; filename="{filename}"')
+        add_line("Content-Type: image/png")
+        add_line("")
+        body.extend(screenshot_bytes)
+        body.extend(b"\r\n")
+
+        add_line(f"--{boundary}--")
+        return bytes(body), f"multipart/form-data; boundary={boundary}"
 
     def _publish(self, event_type: str, detail: str) -> None:
         self.events.put((event_type, detail))
@@ -3663,8 +3684,6 @@ class AutoKeyboardApp:
             elif event_type == "notified":
                 self.recaptcha_status_var.set(detail)
                 self.status_var.set(detail)
-            elif event_type == "rate_limited":
-                self.recaptcha_status_var.set(detail)
             elif event_type == "error":
                 self.recaptcha_status_var.set(detail)
                 self.status_var.set(detail)
