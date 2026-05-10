@@ -1,7 +1,7 @@
 [Setup]
 AppId={{A9D31B90-EC5D-4A51-8792-55F52C39391C}
 AppName=AutoKeyboard
-AppVersion=1.3.8
+AppVersion=1.3.9
 AppPublisher=AutoKeyboard
 DefaultDirName={localappdata}\Programs\AutoKeyboard
 DefaultGroupName=AutoKeyboard
