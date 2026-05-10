@@ -2314,7 +2314,7 @@ class AutoKeyboardApp:
 
         self.name_var = tk.StringVar()
         self.hotkey_var = tk.StringVar()
-        self.hotkey_hint_var = tk.StringVar(value="按「錄製」設定腳本快捷鍵")
+        self.hotkey_hint_var = tk.StringVar(value="按「綁定」設定腳本快捷鍵")
         self.repeat_var = tk.BooleanVar(value=True)
         self.step_action_var = tk.StringVar(value=FORM_ACTION_LABELS[FORM_ACTION_KEY_COMMAND])
         self.step_key_mode_var = tk.StringVar(value=KEY_MODE_BOTH)
@@ -2653,9 +2653,12 @@ class AutoKeyboardApp:
         self.hotkey_entry.bind("<KeyPress>", self._capture_hotkey_from_entry)
         self.hotkey_entry.bind("<FocusOut>", self._cancel_hotkey_recording)
         self.hotkey_entry.configure(state="disabled")
-        ttk.Button(hotkey_row, text="錄製", style="Ghost.TButton", command=self._capture_hotkey).grid(row=0, column=1)
+        ttk.Button(hotkey_row, text="綁定", style="Ghost.TButton", command=self._capture_hotkey).grid(
+            row=0, column=1, padx=(0, 6)
+        )
+        ttk.Button(hotkey_row, text="清除", style="Ghost.TButton", command=self._clear_hotkey).grid(row=0, column=2)
         ttk.Label(hotkey_row, textvariable=self.hotkey_hint_var, style="Small.TLabel").grid(
-            row=1, column=0, columnspan=2, sticky="w", pady=(6, 0)
+            row=1, column=0, columnspan=3, sticky="w", pady=(6, 0)
         )
 
         ttk.Checkbutton(editor, text="循環執行直到停止", variable=self.repeat_var).grid(
@@ -2920,7 +2923,7 @@ class AutoKeyboardApp:
             self.script_tree.delete(item)
 
         for index, script in enumerate(self.scripts):
-            values = (script.name, script.hotkey or "手動", self._status_for(script.id))
+            values = (script.name, script.hotkey or "綁定", self._status_for(script.id))
             tags = self._tags_for(script.id)
             if self._script_dragging and script.id == self._script_drag_start_id:
                 tags = tags + ("script_dragging",)
@@ -3533,10 +3536,46 @@ class AutoKeyboardApp:
         self.hotkey_hint_var.set("請按下要設定的快捷鍵")
         self.status_var.set("請按下要設定的快捷鍵。")
 
+    def _clear_hotkey(self) -> None:
+        script = self._selected_script()
+        if script is None:
+            return
+
+        if self._hotkey_register_after_id is not None:
+            self.root.after_cancel(self._hotkey_register_after_id)
+            self._hotkey_register_after_id = None
+        if self._recording_hotkey:
+            self._recording_hotkey = False
+            self.hotkey_entry.configure(state="disabled")
+            self._clear_pending_hotkey_events()
+
+        self._loading_script = True
+        try:
+            self.hotkey_var.set("")
+        finally:
+            self._loading_script = False
+        self.hotkey_hint_var.set("按「綁定」設定腳本快捷鍵")
+
+        if script.hotkey:
+            script.hotkey = ""
+            self._save_all()
+            self._refresh_script_tree()
+            errors = self.hotkeys.set_hotkeys(self.scripts)
+            if errors:
+                self.status_var.set("；".join(errors))
+            else:
+                self.status_var.set("已清除快捷鍵。")
+        else:
+            errors = self.hotkeys.set_hotkeys(self.scripts)
+            if errors:
+                self.status_var.set("；".join(errors))
+            else:
+                self.status_var.set("快捷鍵已是空白。")
+
     def _finish_hotkey_recording(self, message: str | None = None) -> None:
         self._recording_hotkey = False
         self.hotkey_entry.configure(state="disabled")
-        self.hotkey_hint_var.set("按「錄製」設定腳本快捷鍵")
+        self.hotkey_hint_var.set("按「綁定」設定腳本快捷鍵")
         if message:
             self.status_var.set(message)
         self._clear_pending_hotkey_events()
@@ -3550,7 +3589,7 @@ class AutoKeyboardApp:
 
     def _cancel_hotkey_recording(self, _event: tk.Event | None = None) -> None:
         if self._recording_hotkey:
-            self._finish_hotkey_recording("已取消快捷鍵錄製。")
+            self._finish_hotkey_recording("已取消快捷鍵綁定。")
 
     def _capture_step_key(self) -> None:
         self.step_key_entry.focus_set()
@@ -3582,7 +3621,7 @@ class AutoKeyboardApp:
                 messagebox.showwarning(APP_TITLE, message)
                 return "break"
         self.hotkey_var.set(key_text)
-        self._finish_hotkey_recording(f"已錄製快捷鍵：{key_text}")
+        self._finish_hotkey_recording(f"已綁定快捷鍵：{key_text}")
         return "break"
 
     def _capture_step_key_from_entry(self, event: tk.Event) -> str:
