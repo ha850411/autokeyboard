@@ -68,6 +68,7 @@ LEGACY_CONFIG_PATH = app_directory() / CONFIG_FILENAME
 CONFIG_PATH = user_data_directory() / CONFIG_FILENAME
 MONITOR_CONFIG_PATH = user_data_directory() / MONITOR_CONFIG_FILENAME
 RECAPTCHA_TEMPLATE_PATH = resource_path("assets/check/recaptcha.jpg")
+RECAPTCHA_FULL_TEMPLATE_PATH = resource_path("assets/check/full-recaptcha.png")
 RECAPTCHA_SCAN_INTERVAL_SECONDS = 0.5
 RECAPTCHA_FEATURE_SCAN_INTERVAL_SECONDS = 0.33
 RECAPTCHA_CONFIRM_SECONDS = 1.0
@@ -75,6 +76,7 @@ RECAPTCHA_MATCH_DOWNSAMPLE = 0.5
 RECAPTCHA_FULL_RES_MAX_PIXELS = 1_000_000
 RECAPTCHA_MATCH_THRESHOLD = 22.0
 RECAPTCHA_CV_MATCH_THRESHOLD = 0.94
+RECAPTCHA_FULL_CV_MATCH_THRESHOLD = 0.90
 RECAPTCHA_TINY_CV_MATCH_THRESHOLD = 0.88
 RECAPTCHA_SMALL_CV_MATCH_THRESHOLD = 0.9
 RECAPTCHA_VERIFY_MEAN_THRESHOLD = 20.0
@@ -211,18 +213,22 @@ HOLD_REPEAT_MS = 35
 ACTION_KEY_DOWN = "key_down"
 ACTION_DELAY = "delay"
 ACTION_KEY_UP = "key_up"
+ACTION_SCRIPT_CALL = "script_call"
 ACTION_LABELS = {
     ACTION_KEY_DOWN: "按下按鍵↓",
     ACTION_DELAY: "延遲",
     ACTION_KEY_UP: "放開按鍵↑",
+    ACTION_SCRIPT_CALL: "呼叫腳本",
 }
 ACTION_BY_LABEL = {label: action for action, label in ACTION_LABELS.items()}
 
 FORM_ACTION_KEY_COMMAND = "key_command"
 FORM_ACTION_DELAY = ACTION_DELAY
+FORM_ACTION_SCRIPT_CALL = ACTION_SCRIPT_CALL
 FORM_ACTION_LABELS = {
     FORM_ACTION_KEY_COMMAND: "按鍵指令",
     FORM_ACTION_DELAY: "延遲",
+    FORM_ACTION_SCRIPT_CALL: "呼叫腳本",
 }
 FORM_ACTION_BY_LABEL = {label: action for action, label in FORM_ACTION_LABELS.items()}
 
@@ -474,8 +480,15 @@ def normalize_step_action(value: str) -> str:
         "keyup": ACTION_KEY_UP,
         "key_up": ACTION_KEY_UP,
         "press_up": ACTION_KEY_UP,
+        "script": ACTION_SCRIPT_CALL,
+        "script_call": ACTION_SCRIPT_CALL,
+        "call_script": ACTION_SCRIPT_CALL,
+        "run_script": ACTION_SCRIPT_CALL,
+        "insert_script": ACTION_SCRIPT_CALL,
         "按下按鍵": ACTION_KEY_DOWN,
         "放開按鍵": ACTION_KEY_UP,
+        "呼叫腳本": ACTION_SCRIPT_CALL,
+        "插入腳本": ACTION_SCRIPT_CALL,
     }
     if value in ACTION_BY_LABEL:
         return ACTION_BY_LABEL[value]
@@ -717,6 +730,7 @@ class Step:
     action: str
     key: str = ""
     delay_ms: int = 0
+    script_id: str = ""
 
     @classmethod
     def from_dicts(cls, data: dict) -> list["Step"]:
@@ -736,15 +750,23 @@ class Step:
         action = normalize_step_action(str(data.get("action") or data.get("kind") or ACTION_KEY_DOWN))
         if action == ACTION_DELAY:
             return [cls(action, delay_ms=max(0, int(data.get("delay_ms", data.get("ms", 0)))))]
+        if action == ACTION_SCRIPT_CALL:
+            script_id = data.get("script_id", data.get("target_script_id", data.get("script", "")))
+            return [cls(action, script_id=str(script_id or ""))]
         return [cls(action, key=str(data.get("key", "SPACE")))]
 
     def to_dict(self) -> dict:
         if self.action == ACTION_DELAY:
             return {"action": self.action, "delay_ms": self.delay_ms}
+        if self.action == ACTION_SCRIPT_CALL:
+            return {"action": self.action, "script_id": self.script_id}
         return {"action": self.action, "key": self.key}
 
     def needs_key(self) -> bool:
         return self.action in {ACTION_KEY_DOWN, ACTION_KEY_UP}
+
+    def needs_script(self) -> bool:
+        return self.action == ACTION_SCRIPT_CALL
 
     def display_action(self) -> str:
         return ACTION_LABELS.get(self.action, self.action)
@@ -783,6 +805,44 @@ class Script:
 
     def clone(self) -> "Script":
         return Script.from_dict(self.to_dict())
+
+
+def scripts_by_id(scripts: Iterable[Script]) -> dict[str, Script]:
+    return {script.id: script for script in scripts}
+
+
+def _script_cycle_text(script_ids: list[str], script_lookup: dict[str, Script]) -> str:
+    names = [script_lookup[script_id].name for script_id in script_ids if script_id in script_lookup]
+    return " -> ".join(names) if names else "未知腳本"
+
+
+def validate_script_references(
+    script: Script,
+    script_lookup: dict[str, Script],
+    stack: list[str] | None = None,
+) -> None:
+    stack = stack or []
+    stack.append(script.id)
+    try:
+        for index, step in enumerate(script.steps, start=1):
+            if step.needs_key():
+                KeyResolver.resolve_key_actions(step.key)
+            elif step.needs_script():
+                target_id = step.script_id.strip()
+                if not target_id:
+                    raise ValueError(f"{script.name} 的第 {index} 格尚未選擇要呼叫的腳本。")
+
+                target = script_lookup.get(target_id)
+                if target is None:
+                    raise ValueError(f"{script.name} 的第 {index} 格找不到要呼叫的腳本。")
+
+                if target.id in stack:
+                    cycle_ids = stack[stack.index(target.id):] + [target.id]
+                    raise ValueError(f"腳本呼叫形成循環：{_script_cycle_text(cycle_ids, script_lookup)}")
+
+                validate_script_references(target, script_lookup, stack)
+    finally:
+        stack.pop()
 
 
 def default_scripts() -> list[Script]:
@@ -1103,6 +1163,7 @@ class PreparedTemplate:
     samples: list[tuple[int, int, int, int, int]]
     gray: object | None = None
     important_mask: object | None = None
+    blue_mask: object | None = None
     important_samples: list[tuple[int, int, int, int, int]] = field(default_factory=list)
     scale: float = 1.0
 
@@ -1277,16 +1338,20 @@ class ImageTemplateMatcher:
         downsample: float = RECAPTCHA_MATCH_DOWNSAMPLE,
         threshold: float = RECAPTCHA_MATCH_THRESHOLD,
         scales: tuple[float, ...] | None = None,
+        profile: str = "compact",
     ) -> None:
         if Image is None or ImageChops is None or ImageStat is None:
             raise RuntimeError("缺少 Pillow，請先安裝 Pillow 才能讀取與比對圖片。")
         if not template_path.exists():
             raise FileNotFoundError(f"找不到比對圖片：{template_path}")
+        if profile not in {"compact", "full"}:
+            raise ValueError(f"不支援的比對模式：{profile}")
 
         self._downsample = downsample
         self._threshold = threshold
         self._cv_threshold = RECAPTCHA_CV_MATCH_THRESHOLD
         self._scales = scales
+        self._profile = profile
         self._resample = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
         self._template = Image.open(template_path).convert("RGB")
         self._templates_by_downsample: dict[tuple[float, tuple[float, ...]], list[PreparedTemplate]] = {}
@@ -1371,11 +1436,13 @@ class ImageTemplateMatcher:
             image = self._template.resize((width, height), self._resample)
             gray = None
             important_mask = None
+            blue_mask = None
             samples: list[tuple[int, int, int, int, int]] = []
             important_samples: list[tuple[int, int, int, int, int]] = []
             if cv2 is not None and np is not None:
                 gray = np.asarray(image.convert("L"))
                 important_mask = self._important_pixel_mask(image)
+                blue_mask = self._blue_pixel_mask(image)
             else:
                 samples = self._sample_points(image)
                 important_samples = self._important_samples(samples)
@@ -1385,6 +1452,7 @@ class ImageTemplateMatcher:
                     samples=samples,
                     gray=gray,
                     important_mask=important_mask,
+                    blue_mask=blue_mask,
                     important_samples=important_samples,
                     scale=scale,
                 )
@@ -1394,6 +1462,15 @@ class ImageTemplateMatcher:
     def _important_pixel_mask(self, image):
         pixels = np.asarray(image)
         return (pixels[:, :, 0] < 245) | (pixels[:, :, 1] < 245) | (pixels[:, :, 2] < 245)
+
+    def _blue_pixel_mask(self, image):
+        return self._blue_pixels(np.asarray(image))
+
+    def _blue_pixels(self, pixels):
+        red = pixels[:, :, 0].astype(np.int16)
+        green = pixels[:, :, 1].astype(np.int16)
+        blue = pixels[:, :, 2].astype(np.int16)
+        return (blue > 140) & (green > 70) & (green < 210) & (red < 140) & ((blue - red) > 45)
 
     def _important_samples(
         self,
@@ -1419,6 +1496,8 @@ class ImageTemplateMatcher:
         return False
 
     def _cv_threshold_for(self, template: PreparedTemplate) -> float:
+        if self._profile == "full":
+            return RECAPTCHA_FULL_CV_MATCH_THRESHOLD
         if template.scale <= 0.35:
             return RECAPTCHA_TINY_CV_MATCH_THRESHOLD
         if template.scale <= 0.55:
@@ -1436,6 +1515,9 @@ class ImageTemplateMatcher:
         crop = screenshot.crop((x, y, x + template_image.width, y + template_image.height))
         if np is not None:
             crop_array = np.asarray(crop).astype(np.int16)
+            if not self._verify_candidate_palette(crop_array):
+                return False
+
             template_array = np.asarray(template_image).astype(np.int16)
             diff = np.abs(crop_array - template_array)
             per_pixel = diff.mean(axis=2)
@@ -1444,7 +1526,7 @@ class ImageTemplateMatcher:
             good_ratio = float((per_pixel <= good_pixel_threshold).mean())
             if mean > mean_threshold or good_ratio < good_pixel_ratio:
                 return False
-            return self._verify_important_pixels(per_pixel, template)
+            return self._verify_important_pixels(per_pixel, template) and self._verify_blue_pixels(crop_array, template)
 
         diff = ImageChops.difference(crop, template_image)
         mean = sum(ImageStat.Stat(diff).mean) / 3
@@ -1460,6 +1542,35 @@ class ImageTemplateMatcher:
             RECAPTCHA_VERIFY_MEAN_THRESHOLD,
             RECAPTCHA_VERIFY_GOOD_PIXEL_THRESHOLD,
             RECAPTCHA_VERIFY_GOOD_PIXEL_RATIO,
+        )
+
+    def _verify_candidate_palette(self, crop_array) -> bool:
+        if crop_array.size == 0:
+            return False
+
+        red = crop_array[:, :, 0].astype(np.int16)
+        green = crop_array[:, :, 1].astype(np.int16)
+        blue = crop_array[:, :, 2].astype(np.int16)
+        area = crop_array.shape[0] * crop_array.shape[1]
+        bright = (red > 210) & (green > 210) & (blue > 210)
+        blue_pixels = self._blue_pixels(crop_array)
+        saturated = (np.maximum.reduce((red, green, blue)) - np.minimum.reduce((red, green, blue))) > 70
+        saturated_not_blue = saturated & ~blue_pixels
+        dark = (red < 80) & (green < 80) & (blue < 80)
+
+        if self._profile == "full":
+            return (
+                int(bright.sum()) / area >= 0.70
+                and int(blue_pixels.sum()) / area >= 0.025
+                and int(saturated_not_blue.sum()) / area <= 0.11
+                and int(dark.sum()) / area <= 0.05
+            )
+
+        return (
+            int(bright.sum()) / area >= 0.66
+            and int(blue_pixels.sum()) / area >= 0.12
+            and int(saturated_not_blue.sum()) / area <= 0.05
+            and int(dark.sum()) / area <= 0.06
         )
 
     def _verify_important_pixels(self, per_pixel, template: PreparedTemplate) -> bool:
@@ -1479,6 +1590,22 @@ class ImageTemplateMatcher:
             float(important_errors.mean()) <= important_mean_threshold
             and float((important_errors <= good_pixel_threshold).mean()) >= important_good_ratio
         )
+
+    def _verify_blue_pixels(self, crop_array, template: PreparedTemplate) -> bool:
+        blue_mask = template.blue_mask
+        if blue_mask is None:
+            return True
+
+        blue_count = int(blue_mask.sum())
+        if blue_count < 8:
+            return True
+
+        crop_blue_pixels = self._blue_pixels(crop_array)
+        if self._profile == "full":
+            return float(crop_blue_pixels[blue_mask].mean()) >= 0.80
+
+        required_ratio = 0.78 if template.scale <= 0.35 else 0.84 if template.scale <= 0.55 else 0.88
+        return float(crop_blue_pixels[blue_mask].mean()) >= required_ratio
 
     def _verify_important_samples(
         self,
@@ -1581,6 +1708,32 @@ class ImageTemplateMatcher:
         return False
 
 
+class LieDetectionMatcher:
+    def __init__(
+        self,
+        compact_template_path: Path = RECAPTCHA_TEMPLATE_PATH,
+        full_template_path: Path = RECAPTCHA_FULL_TEMPLATE_PATH,
+    ) -> None:
+        self._compact_matcher = ImageTemplateMatcher(compact_template_path, profile="compact")
+        self._full_matcher = (
+            ImageTemplateMatcher(full_template_path, profile="full") if full_template_path.exists() else None
+        )
+
+    def contains(self, screenshot) -> bool:
+        return self.analyze(screenshot).matched
+
+    def analyze(self, screenshot) -> ImageMatchResult:
+        compact_result = self._compact_matcher.analyze(screenshot)
+        if not compact_result.matched or self._full_matcher is None:
+            return compact_result
+
+        full_result = self._full_matcher.analyze(screenshot)
+        return ImageMatchResult(
+            matched=full_result.matched,
+            has_features=compact_result.has_features or full_result.has_features,
+        )
+
+
 class RecaptchaMonitor:
     def __init__(self, event_queue: queue.Queue[tuple[str, str]], excluded_pid: int | None = None) -> None:
         self.events = event_queue
@@ -1616,7 +1769,7 @@ class RecaptchaMonitor:
     def _run(self) -> None:
         try:
             capture = FocusedWindowCapture(excluded_pid=self._excluded_pid)
-            matcher = ImageTemplateMatcher(RECAPTCHA_TEMPLATE_PATH)
+            matcher = LieDetectionMatcher(RECAPTCHA_TEMPLATE_PATH, RECAPTCHA_FULL_TEMPLATE_PATH)
         except Exception as exc:
             self._publish("error", f"測謊偵測無法啟動：{exc}")
             return
@@ -1749,10 +1902,18 @@ class RecaptchaMonitor:
 
 
 class ScriptRunner:
-    def __init__(self, script: Script, keyboard: WindowsKeyboard, event_queue: queue.Queue[tuple]) -> None:
+    def __init__(
+        self,
+        script: Script,
+        keyboard: WindowsKeyboard,
+        event_queue: queue.Queue[tuple],
+        scripts: Iterable[Script] | None = None,
+    ) -> None:
         self.script = script
         self._keyboard = keyboard
         self._event_queue = event_queue
+        self._scripts_by_id = scripts_by_id(scripts or [script])
+        self._scripts_by_id[script.id] = script
         self._stop_event = threading.Event()
         self._thread = threading.Thread(target=self._run, name=f"ScriptRunner:{script.name}", daemon=True)
 
@@ -1789,38 +1950,70 @@ class ScriptRunner:
             if time.monotonic() < end_at:
                 self._keyboard.key_down_many(held)
 
+    def _execute_steps(
+        self,
+        script: Script,
+        held_actions: list[KeyAction],
+        *,
+        prefix: str = "",
+        stack: list[str] | None = None,
+    ) -> bool:
+        stack = stack or []
+        if script.id in stack:
+            cycle_ids = stack[stack.index(script.id):] + [script.id]
+            raise ValueError(f"腳本呼叫形成循環：{_script_cycle_text(cycle_ids, self._scripts_by_id)}")
+
+        stack.append(script.id)
+        try:
+            for index, step in enumerate(script.steps, start=1):
+                if self._stop_event.is_set():
+                    return True
+
+                position = f"{prefix}{index}"
+                if step.action == ACTION_KEY_DOWN:
+                    actions = KeyResolver.resolve_key_actions(step.key)
+                    self._event_queue.put(("step", self.script.id, f"{position}. {step.key} 按下按鍵"))
+                    self._keyboard.key_down_many(actions)
+                    held_actions.extend(actions)
+                elif step.action == ACTION_KEY_UP:
+                    actions = KeyResolver.resolve_key_actions(step.key)
+                    self._event_queue.put(("step", self.script.id, f"{position}. {step.key} 放開按鍵"))
+                    self._keyboard.key_up_many(actions)
+                    for action in actions:
+                        for held_index in range(len(held_actions) - 1, -1, -1):
+                            if held_actions[held_index] == action:
+                                del held_actions[held_index]
+                                break
+                elif step.action == ACTION_DELAY:
+                    held_count = len(unique_key_actions(held_actions))
+                    if held_count:
+                        detail = f"{position}. 延遲 {step.delay_ms} ms (維持 {held_count} 個按鍵)"
+                    else:
+                        detail = f"{position}. 延遲 {step.delay_ms} ms"
+                    self._event_queue.put(("step", self.script.id, detail))
+                    if self._delay_with_held_keys(step.delay_ms, held_actions):
+                        return True
+                elif step.action == ACTION_SCRIPT_CALL:
+                    target_id = step.script_id.strip()
+                    target = self._scripts_by_id.get(target_id)
+                    if target is None:
+                        raise ValueError(f"{script.name} 的第 {position} 格找不到要呼叫的腳本。")
+
+                    self._event_queue.put(("step", self.script.id, f"{position}. 呼叫腳本：{target.name}"))
+                    if self._execute_steps(target, held_actions, prefix=f"{position}.", stack=stack):
+                        return True
+
+            return False
+        finally:
+            stack.pop()
+
     def _run(self) -> None:
         self._event_queue.put(("started", self.script.id, ""))
         held_actions: list[KeyAction] = []
         try:
             while not self._stop_event.is_set():
-                for index, step in enumerate(self.script.steps, start=1):
-                    if self._stop_event.is_set():
-                        break
-
-                    if step.action == ACTION_KEY_DOWN:
-                        actions = KeyResolver.resolve_key_actions(step.key)
-                        self._event_queue.put(("step", self.script.id, f"{index}. {step.key} 按下按鍵"))
-                        self._keyboard.key_down_many(actions)
-                        held_actions.extend(actions)
-                    elif step.action == ACTION_KEY_UP:
-                        actions = KeyResolver.resolve_key_actions(step.key)
-                        self._event_queue.put(("step", self.script.id, f"{index}. {step.key} 放開按鍵"))
-                        self._keyboard.key_up_many(actions)
-                        for action in actions:
-                            for held_index in range(len(held_actions) - 1, -1, -1):
-                                if held_actions[held_index] == action:
-                                    del held_actions[held_index]
-                                    break
-                    elif step.action == ACTION_DELAY:
-                        held_count = len(unique_key_actions(held_actions))
-                        if held_count:
-                            detail = f"{index}. 延遲 {step.delay_ms} ms (維持 {held_count} 個按鍵)"
-                        else:
-                            detail = f"{index}. 延遲 {step.delay_ms} ms"
-                        self._event_queue.put(("step", self.script.id, detail))
-                        if self._delay_with_held_keys(step.delay_ms, held_actions):
-                            break
+                if self._execute_steps(self.script, held_actions):
+                    break
 
                 if not self.script.repeat:
                     break
@@ -2039,6 +2232,8 @@ class AutoKeyboardApp:
         self._step_drag_start_row: str | None = None
         self._step_drag_started_on_selection = False
         self._step_clipboard: list[Step] = []
+        self._script_call_choice_by_label: dict[str, str] = {}
+        self._script_call_label_by_id: dict[str, str] = {}
 
         self.name_var = tk.StringVar()
         self.hotkey_var = tk.StringVar()
@@ -2048,6 +2243,7 @@ class AutoKeyboardApp:
         self.step_key_mode_var = tk.StringVar(value=KEY_MODE_BOTH)
         self.step_key_var = tk.StringVar(value="SPACE")
         self.step_delay_ms_var = tk.StringVar(value="1,000")
+        self.step_script_var = tk.StringVar()
         self.recaptcha_enabled_var = tk.BooleanVar(value=self.recaptcha_settings.enabled)
         self.recaptcha_maplestory_only_var = tk.BooleanVar(value=self.recaptcha_settings.only_maplestory_window)
         self.recaptcha_recipient_name_var = tk.StringVar(value=self.recaptcha_settings.recipient_name)
@@ -2397,10 +2593,10 @@ class AutoKeyboardApp:
 
         self.step_tree = ttk.Treeview(right, columns=("action", "key", "delay"), show="headings", selectmode="extended")
         self.step_tree.heading("action", text="動作")
-        self.step_tree.heading("key", text="按鍵")
+        self.step_tree.heading("key", text="內容")
         self.step_tree.heading("delay", text="延遲")
         self.step_tree.column("action", width=120, minwidth=100)
-        self.step_tree.column("key", width=160, minwidth=120)
+        self.step_tree.column("key", width=180, minwidth=120)
         self.step_tree.column("delay", width=110, minwidth=90, anchor="center")
         self.step_tree.tag_configure("step_odd", background="#ffffff")
         self.step_tree.tag_configure("step_even", background="#f8fafc")
@@ -2442,7 +2638,15 @@ class AutoKeyboardApp:
             variable=self.step_action_var,
             command=self._on_step_action_changed,
             style="Large.TRadiobutton",
-        ).grid(row=0, column=1, sticky="w")
+        ).grid(row=0, column=1, sticky="w", padx=(0, 14))
+        ttk.Radiobutton(
+            action_options,
+            text=FORM_ACTION_LABELS[FORM_ACTION_SCRIPT_CALL],
+            value=FORM_ACTION_LABELS[FORM_ACTION_SCRIPT_CALL],
+            variable=self.step_action_var,
+            command=self._on_step_action_changed,
+            style="Large.TRadiobutton",
+        ).grid(row=0, column=2, sticky="w")
 
         self.key_settings_frame = ttk.Frame(step_form, style="Panel.TFrame")
         self.key_settings_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
@@ -2500,6 +2704,21 @@ class AutoKeyboardApp:
             text="延遲是獨立動作；若前面有按下按鍵，延遲期間會持續維持按住。",
             style="Small.TLabel",
         ).grid(row=1, column=1, sticky="w", pady=(6, 0))
+
+        self.script_call_settings_frame = ttk.Frame(step_form, style="Panel.TFrame")
+        self.script_call_settings_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        self.script_call_settings_frame.columnconfigure(1, weight=1)
+        ttk.Label(self.script_call_settings_frame, text="腳本", style="Panel.TLabel").grid(
+            row=0, column=0, sticky="w", padx=(0, 6)
+        )
+        self.step_script_combo = ttk.Combobox(
+            self.script_call_settings_frame,
+            textvariable=self.step_script_var,
+            values=(),
+            state="readonly",
+            style="Recipient.TCombobox",
+        )
+        self.step_script_combo.grid(row=0, column=1, sticky="ew")
         self._on_step_action_changed()
 
         step_buttons = ttk.Frame(right, style="Toolbar.TFrame")
@@ -2546,6 +2765,68 @@ class AutoKeyboardApp:
     def _find_script(self, script_id: str) -> Script | None:
         return next((script for script in self.scripts if script.id == script_id), None)
 
+    def _script_call_label(self, script: Script, name_counts: dict[str, int] | None = None) -> str:
+        if name_counts is None:
+            name_counts = {item.name: sum(1 for script_item in self.scripts if script_item.name == item.name) for item in self.scripts}
+        if name_counts.get(script.name, 0) > 1:
+            return f"{script.name} ({script.id[:8]})"
+        return script.name
+
+    def _refresh_script_call_choices(self) -> None:
+        if not hasattr(self, "step_script_combo"):
+            return
+
+        current_label = self.step_script_var.get()
+        current_target_id = self._script_call_choice_by_label.get(current_label, "")
+        current_script_id = self._selected_script_id()
+        name_counts: dict[str, int] = {}
+        for script in self.scripts:
+            name_counts[script.name] = name_counts.get(script.name, 0) + 1
+
+        options = [
+            (self._script_call_label(script, name_counts), script.id)
+            for script in self.scripts
+            if script.id != current_script_id
+        ]
+        self._script_call_choice_by_label = {label: script_id for label, script_id in options}
+        self._script_call_label_by_id = {script_id: label for label, script_id in options}
+        self.step_script_combo.configure(values=[label for label, _script_id in options])
+
+        if current_target_id in self._script_call_label_by_id:
+            self.step_script_var.set(self._script_call_label_by_id[current_target_id])
+
+    def _select_default_script_call_target(self) -> None:
+        self._refresh_script_call_choices()
+        if self.step_script_var.get() not in self._script_call_choice_by_label and self._script_call_label_by_id:
+            first_label = next(iter(self._script_call_choice_by_label))
+            self.step_script_var.set(first_label)
+
+    def _set_script_call_target(self, script_id: str) -> None:
+        self._refresh_script_call_choices()
+        label = self._script_call_label_by_id.get(script_id)
+        if label is not None:
+            self.step_script_var.set(label)
+            return
+
+        script = self._find_script(script_id)
+        if script is not None:
+            self.step_script_var.set(f"{script.name} (目前腳本)")
+        elif script_id:
+            self.step_script_var.set(f"找不到腳本 ({script_id[:8]})")
+        else:
+            self.step_script_var.set("")
+
+    def _selected_script_call_target_id(self) -> str:
+        return self._script_call_choice_by_label.get(self.step_script_var.get(), "")
+
+    def _step_script_display(self, step: Step) -> str:
+        script = self._find_script(step.script_id)
+        if script is not None:
+            return script.name
+        if step.script_id:
+            return f"找不到腳本 ({step.script_id[:8]})"
+        return "未選擇腳本"
+
     def _select_first_script(self) -> None:
         if self.scripts:
             self.script_tree.selection_set(self.scripts[0].id)
@@ -2584,6 +2865,7 @@ class AutoKeyboardApp:
 
         self._update_banner()
         self._update_toggle_button()
+        self._refresh_script_call_choices()
 
     def _sync_script_tree_order(self, wanted_order: list[str]) -> None:
         if list(self.script_tree.get_children()) == wanted_order:
@@ -2720,7 +3002,12 @@ class AutoKeyboardApp:
             return
 
         for index, step in enumerate(script.steps):
-            key = step.key if step.needs_key() else ""
+            if step.needs_key():
+                key = step.key
+            elif step.needs_script():
+                key = self._step_script_display(step)
+            else:
+                key = ""
             delay = format_delay_ms(step.delay_ms) if step.action == ACTION_DELAY else ""
             self.step_tree.insert(
                 "",
@@ -2777,6 +3064,7 @@ class AutoKeyboardApp:
             self.name_var.set(script.name)
             self.hotkey_var.set(script.hotkey)
             self.repeat_var.set(script.repeat)
+            self._refresh_script_call_choices()
             self._refresh_step_tree(script)
         finally:
             self._loading_script = False
@@ -2831,7 +3119,15 @@ class AutoKeyboardApp:
         if script is None:
             return
 
-        if not messagebox.askyesno(APP_TITLE, f"確定刪除「{script.name}」？"):
+        referenced_by = [
+            item.name
+            for item in self.scripts
+            if item.id != script.id and any(step.needs_script() and step.script_id == script.id for step in item.steps)
+        ]
+        message = f"確定刪除「{script.name}」？"
+        if referenced_by:
+            message += f"\n\n有 {len(referenced_by)} 個腳本正在呼叫它，刪除後那些步驟會無法執行。"
+        if not messagebox.askyesno(APP_TITLE, message):
             return
 
         if script.id in self.runners:
@@ -2895,11 +3191,19 @@ class AutoKeyboardApp:
             return
 
         used_names = {script.name for script in self.scripts}
+        imported_id_map: dict[str, str] = {}
         for script in imported_scripts:
+            original_id = script.id
             script.id = str(uuid.uuid4())
+            imported_id_map[original_id] = script.id
             script.hotkey = ""
             script.name = self._unique_imported_script_name(script.name, used_names)
             used_names.add(script.name)
+
+        for script in imported_scripts:
+            for step in script.steps:
+                if step.needs_script() and step.script_id in imported_id_map:
+                    step.script_id = imported_id_map[step.script_id]
 
         self.scripts.extend(imported_scripts)
         self._save_all()
@@ -2974,7 +3278,7 @@ class AutoKeyboardApp:
     def _bind_auto_save(self) -> None:
         for variable in (self.name_var, self.hotkey_var, self.repeat_var):
             variable.trace_add("write", self._schedule_auto_save_script_settings)
-        for variable in (self.step_key_mode_var, self.step_key_var, self.step_delay_ms_var):
+        for variable in (self.step_key_mode_var, self.step_key_var, self.step_delay_ms_var, self.step_script_var):
             variable.trace_add("write", self._schedule_auto_save_selected_step)
         for variable in (
             self.recaptcha_enabled_var,
@@ -3385,7 +3689,7 @@ class AutoKeyboardApp:
         return sorted(set(indices))
 
     def _clone_step(self, step: Step) -> Step:
-        return Step(step.action, key=step.key, delay_ms=step.delay_ms)
+        return Step(step.action, key=step.key, delay_ms=step.delay_ms, script_id=step.script_id)
 
     def _steps_for_key_mode(self, key: str) -> list[Step]:
         mode = self.step_key_mode_var.get()
@@ -3398,13 +3702,30 @@ class AutoKeyboardApp:
             Step(ACTION_KEY_UP, key=key),
         ]
 
+    def _read_script_call_step(self) -> Step:
+        script_id = self._selected_script_call_target_id()
+        if not script_id:
+            raise ValueError("請選擇要呼叫的腳本。")
+
+        target = self._find_script(script_id)
+        if target is None:
+            raise ValueError("找不到要呼叫的腳本。")
+
+        current_script = self._selected_script()
+        if current_script is not None and current_script.id == target.id:
+            raise ValueError("腳本不能呼叫自己。")
+
+        return Step(ACTION_SCRIPT_CALL, script_id=target.id)
+
     def _read_step_form(self, *, show_errors: bool = True, existing_step: Step | None = None) -> list[Step] | None:
         form_action = FORM_ACTION_BY_LABEL.get(self.step_action_var.get(), FORM_ACTION_KEY_COMMAND)
         try:
             if existing_step is not None:
                 if existing_step.action == ACTION_DELAY:
-                    delay_ms = text_to_ms(self.step_delay_ms_var.get().strip(), "撱園 ms", 0)
+                    delay_ms = text_to_ms(self.step_delay_ms_var.get().strip(), "延遲 ms", 0)
                     return [Step(ACTION_DELAY, delay_ms=delay_ms)]
+                if existing_step.action == ACTION_SCRIPT_CALL:
+                    return [self._read_script_call_step()]
 
                 key = self.step_key_var.get().strip()
                 KeyResolver.resolve_key_actions(key)
@@ -3414,6 +3735,8 @@ class AutoKeyboardApp:
             if form_action == FORM_ACTION_DELAY:
                 delay_ms = text_to_ms(self.step_delay_ms_var.get().strip(), "延遲 ms", 0)
                 return [Step(ACTION_DELAY, delay_ms=delay_ms)]
+            if form_action == FORM_ACTION_SCRIPT_CALL:
+                return [self._read_script_call_step()]
 
             key = self.step_key_var.get().strip()
             KeyResolver.resolve_key_actions(key)
@@ -3469,6 +3792,8 @@ class AutoKeyboardApp:
         selected_step = script.steps[index]
         if form_action == FORM_ACTION_DELAY:
             return selected_step.action == ACTION_DELAY
+        if form_action == FORM_ACTION_SCRIPT_CALL:
+            return selected_step.action == ACTION_SCRIPT_CALL
         return selected_step.needs_key()
 
     def _auto_save_selected_step(self) -> None:
@@ -3849,6 +4174,10 @@ class AutoKeyboardApp:
             if step.action == ACTION_DELAY:
                 self.step_action_var.set(FORM_ACTION_LABELS[FORM_ACTION_DELAY])
                 self.step_key_mode_var.set(KEY_MODE_BOTH)
+            elif step.action == ACTION_SCRIPT_CALL:
+                self.step_action_var.set(FORM_ACTION_LABELS[FORM_ACTION_SCRIPT_CALL])
+                self.step_key_mode_var.set(KEY_MODE_BOTH)
+                self._set_script_call_target(step.script_id)
             else:
                 self.step_action_var.set(FORM_ACTION_LABELS[FORM_ACTION_KEY_COMMAND])
                 if step.action == ACTION_KEY_DOWN:
@@ -3867,15 +4196,30 @@ class AutoKeyboardApp:
 
     def _on_step_action_changed(self, _event: tk.Event | None = None) -> None:
         form_action = FORM_ACTION_BY_LABEL.get(self.step_action_var.get(), FORM_ACTION_KEY_COMMAND)
-        if not hasattr(self, "key_settings_frame") or not hasattr(self, "delay_settings_frame"):
+        if (
+            not hasattr(self, "key_settings_frame")
+            or not hasattr(self, "delay_settings_frame")
+            or not hasattr(self, "script_call_settings_frame")
+        ):
             return
 
         if form_action == FORM_ACTION_DELAY:
             self.key_settings_frame.grid_remove()
+            self.script_call_settings_frame.grid_remove()
             self.delay_settings_frame.grid()
             self.status_var.set("延遲是獨立動作，只使用延遲 ms 設定。")
+        elif form_action == FORM_ACTION_SCRIPT_CALL:
+            self.key_settings_frame.grid_remove()
+            self.delay_settings_frame.grid_remove()
+            self.script_call_settings_frame.grid()
+            if self._loading_step:
+                self._refresh_script_call_choices()
+            else:
+                self._select_default_script_call_target()
+            self.status_var.set("呼叫腳本會在這個位置執行選取腳本的一輪步驟。")
         else:
             self.delay_settings_frame.grid_remove()
+            self.script_call_settings_frame.grid_remove()
             self.key_settings_frame.grid()
             self.status_var.set("按鍵指令會自動新增「按下按鍵」與「放開按鍵」一組指令。")
 
@@ -3899,16 +4243,19 @@ class AutoKeyboardApp:
             messagebox.showwarning(APP_TITLE, f"「{script.name}」沒有任何步驟。")
             return
 
-        for step in script.steps:
-            if not step.needs_key():
-                continue
-            try:
-                KeyResolver.resolve_key_actions(step.key)
-            except ValueError as exc:
-                messagebox.showerror(APP_TITLE, f"{script.name} 的步驟「{step.key}」無效：\n{exc}")
-                return
+        script_snapshots = [item.clone() for item in self.scripts]
+        snapshot_lookup = scripts_by_id(script_snapshots)
+        script_snapshot = snapshot_lookup.get(script.id)
+        if script_snapshot is None:
+            return
 
-        runner = ScriptRunner(script.clone(), self.keyboard, self.runtime_events)
+        try:
+            validate_script_references(script_snapshot, snapshot_lookup)
+        except ValueError as exc:
+            messagebox.showerror(APP_TITLE, f"{script.name} 無法啟動：\n{exc}")
+            return
+
+        runner = ScriptRunner(script_snapshot, self.keyboard, self.runtime_events, script_snapshots)
         self.runners[script_id] = runner
         self.current_step[script_id] = "執行中"
         runner.start()

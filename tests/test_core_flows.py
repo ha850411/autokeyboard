@@ -21,6 +21,7 @@ class KeyResolverTests(unittest.TestCase):
         self.assertEqual(ak.normalize_step_action("wait"), ak.ACTION_DELAY)
         self.assertEqual(ak.normalize_step_action("按下按鍵"), ak.ACTION_KEY_DOWN)
         self.assertEqual(ak.normalize_step_action("放開按鍵"), ak.ACTION_KEY_UP)
+        self.assertEqual(ak.normalize_step_action("呼叫腳本"), ak.ACTION_SCRIPT_CALL)
         self.assertEqual(ak.normalize_step_action("unknown"), ak.ACTION_KEY_DOWN)
 
     def test_resolves_named_keys_and_combinations(self) -> None:
@@ -79,12 +80,16 @@ class ScriptSerializationTests(unittest.TestCase):
     def test_step_round_trip_and_display_helpers(self) -> None:
         delay = ak.Step.from_dicts({"kind": "延遲", "ms": 1200})[0]
         key_up = ak.Step.from_dicts({"action": "keyup", "key": "SPACE"})[0]
+        script_call = ak.Step.from_dicts({"action": "script_call", "script_id": "helper"})[0]
 
         self.assertEqual(delay.to_dict(), {"action": ak.ACTION_DELAY, "delay_ms": 1200})
         self.assertEqual(key_up.to_dict(), {"action": ak.ACTION_KEY_UP, "key": "SPACE"})
+        self.assertEqual(script_call.to_dict(), {"action": ak.ACTION_SCRIPT_CALL, "script_id": "helper"})
         self.assertFalse(delay.needs_key())
         self.assertTrue(key_up.needs_key())
+        self.assertTrue(script_call.needs_script())
         self.assertEqual(key_up.display_action(), "放開按鍵↑")
+        self.assertEqual(script_call.display_action(), "呼叫腳本")
 
     def test_script_from_dict_uses_defaults_and_round_trips(self) -> None:
         script = ak.Script.from_dict(
@@ -314,6 +319,67 @@ class ScriptRunnerTests(unittest.TestCase):
         self.assertIn(("step", "runner", "2. 延遲 0 ms (維持 1 個按鍵)"), events)
         self.assertIn(("step", "runner", "3. A 放開按鍵"), events)
         self.assertEqual(events[-1], ("stopped", "runner", ""))
+
+    def test_runner_executes_called_script_inline(self) -> None:
+        event_queue: queue.Queue[tuple] = queue.Queue()
+        keyboard = FakeKeyboard()
+        helper = ak.Script(
+            id="helper",
+            name="helper",
+            repeat=True,
+            steps=[
+                ak.Step(ak.ACTION_KEY_DOWN, key="B"),
+                ak.Step(ak.ACTION_DELAY, delay_ms=0),
+                ak.Step(ak.ACTION_KEY_UP, key="B"),
+            ],
+        )
+        script = ak.Script(
+            id="main",
+            name="main",
+            repeat=False,
+            steps=[
+                ak.Step(ak.ACTION_KEY_DOWN, key="A"),
+                ak.Step(ak.ACTION_SCRIPT_CALL, script_id="helper"),
+                ak.Step(ak.ACTION_KEY_UP, key="A"),
+            ],
+        )
+
+        runner = ak.ScriptRunner(script, keyboard, event_queue, [script, helper])
+        runner.start()
+
+        self.assertTrue(runner.join(timeout=2))
+        self.assertEqual(
+            keyboard.calls,
+            [
+                ("down", ak.KeyAction(ord("A"))),
+                ("down", ak.KeyAction(ord("B"))),
+                ("up", ak.KeyAction(ord("B"))),
+                ("up", ak.KeyAction(ord("A"))),
+            ],
+        )
+
+        events = []
+        while not event_queue.empty():
+            events.append(event_queue.get_nowait())
+
+        self.assertIn(("step", "main", "2. 呼叫腳本：helper"), events)
+        self.assertIn(("step", "main", "2.1. B 按下按鍵"), events)
+        self.assertIn(("step", "main", "2.3. B 放開按鍵"), events)
+
+    def test_validate_script_references_rejects_missing_and_circular_calls(self) -> None:
+        script = ak.Script(
+            id="main",
+            name="main",
+            repeat=False,
+            steps=[ak.Step(ak.ACTION_SCRIPT_CALL, script_id="missing")],
+        )
+
+        with self.assertRaisesRegex(ValueError, "找不到要呼叫的腳本"):
+            ak.validate_script_references(script, {"main": script})
+
+        script.steps = [ak.Step(ak.ACTION_SCRIPT_CALL, script_id="main")]
+        with self.assertRaisesRegex(ValueError, "腳本呼叫形成循環"):
+            ak.validate_script_references(script, {"main": script})
 
     def test_delay_with_held_keys_repeats_until_delay_finishes(self) -> None:
         event_queue: queue.Queue[tuple] = queue.Queue()

@@ -12,6 +12,8 @@ if str(ROOT) not in sys.path:
 
 from autokeyboard import (
     ImageTemplateMatcher,
+    LieDetectionMatcher,
+    RECAPTCHA_FULL_TEMPLATE_PATH,
     RECAPTCHA_MATCH_SCALE_STEP_RATIO,
     RECAPTCHA_TEMPLATE_PATH,
     build_recaptcha_match_scales,
@@ -51,6 +53,44 @@ def maple_shop_like_screenshot() -> Image.Image:
     return image
 
 
+def maple_worlds_catalog_decoy_screenshot() -> Image.Image:
+    image = Image.new("RGB", (1555, 921), (224, 224, 224))
+    draw = ImageDraw.Draw(image)
+
+    draw.rounded_rectangle((142, 23, 1550, 920), radius=34, fill=(250, 249, 247))
+    draw.text((169, 122), "楓之谷世界1週年紀念慶典", fill=(35, 35, 35))
+    draw.text((169, 371), "編輯精選", fill=(35, 35, 35))
+    draw.text((169, 634), "最近遊玩的", fill=(35, 35, 35))
+
+    template = Image.open(RECAPTCHA_TEMPLATE_PATH).convert("RGB")
+    resample = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
+    decoy = template.resize((200, 92), resample)
+    decoy_draw = ImageDraw.Draw(decoy)
+    decoy_draw.rectangle((0, 0, 199, 4), fill=(184, 48, 48))
+    decoy_draw.rectangle((0, 5, 5, 91), fill=(31, 169, 91))
+    decoy_draw.ellipse((160, 35, 195, 70), fill=(250, 201, 40))
+    decoy_draw.text((64, 36), "雪吉拉", fill=(35, 35, 35))
+
+    cards = [
+        (170, 153, (39, 117, 169), "NexTale"),
+        (390, 153, None, "P-Maple 雪吉拉伺服器"),
+        (610, 153, (78, 175, 96), "ChronoStory"),
+        (390, 418, None, "楓星"),
+        (1050, 418, None, "P-Maple 雪吉拉伺服器"),
+    ]
+    for x, y, color, title in cards:
+        draw.rounded_rectangle((x, y, x + 202, y + 175), radius=9, fill=(255, 255, 255), outline=(241, 241, 241))
+        if color is None:
+            image.paste(decoy, (x, y))
+        else:
+            draw.rectangle((x, y, x + 202, y + 92), fill=color)
+            draw.text((x + 35, y + 35), title, fill=(255, 255, 255))
+        draw.text((x + 42, y + 122), title, fill=(86, 86, 86))
+        draw.text((x + 42, y + 145), "MapleStoryWorlds", fill=(160, 160, 160))
+
+    return image
+
+
 def screenshot_with_scaled_lie_detection(scale: float, *, checked: bool = False) -> Image.Image:
     canvas = Image.new("RGB", (1366, 768), (0, 0, 0))
     template = Image.open(RECAPTCHA_TEMPLATE_PATH).convert("RGB")
@@ -67,34 +107,47 @@ def screenshot_with_scaled_lie_detection(scale: float, *, checked: bool = False)
 class LieDetectionMatcherTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.matcher = ImageTemplateMatcher(RECAPTCHA_TEMPLATE_PATH)
+        cls.compact_matcher = ImageTemplateMatcher(RECAPTCHA_TEMPLATE_PATH)
+        cls.matcher = LieDetectionMatcher(RECAPTCHA_TEMPLATE_PATH, RECAPTCHA_FULL_TEMPLATE_PATH)
 
     def test_detects_current_lie_detection_template(self) -> None:
         image = Image.open(RECAPTCHA_TEMPLATE_PATH).convert("RGB")
+
+        result = self.compact_matcher.analyze(image)
+
+        self.assertTrue(result.matched)
+
+    def test_detects_full_lie_detection_template_with_dual_matcher(self) -> None:
+        image = Image.open(RECAPTCHA_FULL_TEMPLATE_PATH).convert("RGB")
 
         result = self.matcher.analyze(image)
 
         self.assertTrue(result.matched)
 
+    def test_cropped_template_alone_does_not_satisfy_dual_matcher(self) -> None:
+        result = self.matcher.analyze(screenshot_with_scaled_lie_detection(0.8, checked=True))
+
+        self.assertFalse(result.matched)
+
     def test_detects_small_in_game_lie_detection_template(self) -> None:
-        result = self.matcher.analyze(screenshot_with_scaled_lie_detection(0.3))
+        result = self.compact_matcher.analyze(screenshot_with_scaled_lie_detection(0.3))
 
         self.assertTrue(result.matched)
 
     def test_detects_high_dpi_scaled_lie_detection_template(self) -> None:
-        result = self.matcher.analyze(screenshot_with_scaled_lie_detection(1.5))
+        result = self.compact_matcher.analyze(screenshot_with_scaled_lie_detection(1.5))
 
         self.assertTrue(result.matched)
 
     def test_detects_1080p_checked_lie_detection_template(self) -> None:
-        result = self.matcher.analyze(screenshot_with_scaled_lie_detection(0.8, checked=True))
+        result = self.compact_matcher.analyze(screenshot_with_scaled_lie_detection(0.8, checked=True))
 
         self.assertTrue(result.matched)
 
     def test_detects_lie_detection_between_manual_scale_points(self) -> None:
         for scale in (0.81, 0.97, 1.23):
             with self.subTest(scale=scale):
-                result = self.matcher.analyze(screenshot_with_scaled_lie_detection(scale, checked=True))
+                result = self.compact_matcher.analyze(screenshot_with_scaled_lie_detection(scale, checked=True))
 
                 self.assertTrue(result.matched)
 
@@ -107,6 +160,11 @@ class LieDetectionMatcherTests(unittest.TestCase):
 
     def test_maple_shop_like_ui_is_not_detected(self) -> None:
         result = self.matcher.analyze(maple_shop_like_screenshot())
+
+        self.assertFalse(result.matched)
+
+    def test_maple_worlds_catalog_card_decoy_is_not_detected(self) -> None:
+        result = self.matcher.analyze(maple_worlds_catalog_decoy_screenshot())
 
         self.assertFalse(result.matched)
 
