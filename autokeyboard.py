@@ -85,6 +85,9 @@ RECAPTCHA_VERIFY_GOOD_PIXEL_RATIO = 0.88
 RECAPTCHA_MATCH_SCALE_MIN = 0.12
 RECAPTCHA_MATCH_SCALE_MAX = 2.0
 RECAPTCHA_MATCH_SCALE_STEP_RATIO = 1.035
+RECAPTCHA_PREFERRED_MATCH_SCALE = 1.0
+RECAPTCHA_NOTIFY_INTERVAL_SECONDS = 2.0
+RECAPTCHA_MAX_NOTIFICATION_WORKERS = 3
 DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
 PROCESS_PER_MONITOR_DPI_AWARE = 2
 
@@ -1172,6 +1175,7 @@ class PreparedTemplate:
 class ImageMatchResult:
     matched: bool
     has_features: bool
+    match_scale: float | None = None
 
 
 class FocusedWindowCapture:
@@ -1355,11 +1359,12 @@ class ImageTemplateMatcher:
         self._resample = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
         self._template = Image.open(template_path).convert("RGB")
         self._templates_by_downsample: dict[tuple[float, tuple[float, ...]], list[PreparedTemplate]] = {}
+        self._last_match_scale: float | None = None
 
     def contains(self, screenshot) -> bool:
         return self.analyze(screenshot).matched
 
-    def analyze(self, screenshot) -> ImageMatchResult:
+    def analyze(self, screenshot, *, preferred_scale: float | None = None) -> ImageMatchResult:
         if screenshot.width <= 0 or screenshot.height <= 0:
             return ImageMatchResult(matched=False, has_features=False)
 
@@ -1374,17 +1379,22 @@ class ImageTemplateMatcher:
 
         scales = self._scales_for_screenshot(screenshot)
         templates = self._templates_for_downsample(downsample, scales)
+        templates = self._prioritized_templates(templates, preferred_scale)
 
         if cv2 is not None and np is not None:
-            return ImageMatchResult(
-                matched=self._contains_with_cv(small_screenshot, templates),
-                has_features=True,
-            )
+            return self._remember_match_scale(self._match_with_cv(small_screenshot, templates))
 
         for prepared in templates:
             if self._contains_template(small_screenshot, prepared):
-                return ImageMatchResult(matched=True, has_features=True)
+                return self._remember_match_scale(
+                    ImageMatchResult(matched=True, has_features=True, match_scale=prepared.scale)
+                )
         return ImageMatchResult(matched=False, has_features=True)
+
+    def _remember_match_scale(self, result: ImageMatchResult) -> ImageMatchResult:
+        if result.matched and result.match_scale is not None:
+            self._last_match_scale = result.match_scale
+        return result
 
     def _effective_downsample(self, screenshot) -> float:
         if cv2 is None or np is None:
@@ -1427,6 +1437,16 @@ class ImageTemplateMatcher:
             templates = self._prepare_templates(scales, downsample)
             self._templates_by_downsample[key] = templates
         return templates
+
+    def _prioritized_templates(
+        self,
+        templates: list[PreparedTemplate],
+        preferred_scale: float | None,
+    ) -> list[PreparedTemplate]:
+        scale_hint = preferred_scale or self._last_match_scale or RECAPTCHA_PREFERRED_MATCH_SCALE
+        if scale_hint <= 0:
+            return templates
+        return sorted(templates, key=lambda template: (abs(template.scale - scale_hint), template.scale))
 
     def _prepare_templates(self, scales: tuple[float, ...], downsample: float) -> list[PreparedTemplate]:
         templates: list[PreparedTemplate] = []
@@ -1479,6 +1499,9 @@ class ImageTemplateMatcher:
         return [sample for sample in samples if sample[2] < 245 or sample[3] < 245 or sample[4] < 245]
 
     def _contains_with_cv(self, screenshot, templates: list[PreparedTemplate]) -> bool:
+        return self._match_with_cv(screenshot, templates).matched
+
+    def _match_with_cv(self, screenshot, templates: list[PreparedTemplate]) -> ImageMatchResult:
         screenshot_gray = np.asarray(screenshot.convert("L"))
         for prepared in templates:
             template_gray = prepared.gray
@@ -1492,8 +1515,8 @@ class ImageTemplateMatcher:
                 continue
             _, max_value, _, max_location = cv2.minMaxLoc(result)
             if max_value >= self._cv_threshold_for(prepared) and self._verify_candidate(screenshot, prepared, max_location):
-                return True
-        return False
+                return ImageMatchResult(matched=True, has_features=True, match_scale=prepared.scale)
+        return ImageMatchResult(matched=False, has_features=True)
 
     def _cv_threshold_for(self, template: PreparedTemplate) -> float:
         if self._profile == "full":
@@ -1727,10 +1750,11 @@ class LieDetectionMatcher:
         if not compact_result.matched or self._full_matcher is None:
             return compact_result
 
-        full_result = self._full_matcher.analyze(screenshot)
+        full_result = self._full_matcher.analyze(screenshot, preferred_scale=compact_result.match_scale)
         return ImageMatchResult(
             matched=full_result.matched,
             has_features=compact_result.has_features or full_result.has_features,
+            match_scale=full_result.match_scale,
         )
 
 
@@ -1745,6 +1769,9 @@ class RecaptchaMonitor:
         self._last_error = ""
         self._last_error_at = 0.0
         self._match_started_at: float | None = None
+        self._last_notification_started_at = 0.0
+        self._active_notifications = 0
+        self._notification_lock = threading.Lock()
 
     def start(self) -> None:
         if self._thread is not None:
@@ -1791,7 +1818,7 @@ class RecaptchaMonitor:
                     if result.has_features:
                         scan_interval = RECAPTCHA_FEATURE_SCAN_INTERVAL_SECONDS
                     if matched and self._is_confirmed_match():
-                        self._notify_detected(recipient.webhook_url, recipient.user_id, screenshot)
+                        self._queue_detected_notification(recipient.webhook_url, recipient.user_id, screenshot)
                     elif not matched:
                         self._reset_match_confirmation()
                 except Exception as exc:
@@ -1812,6 +1839,8 @@ class RecaptchaMonitor:
 
     def _reset_match_confirmation(self) -> None:
         self._match_started_at = None
+        with self._notification_lock:
+            self._last_notification_started_at = 0.0
 
     def _settings_snapshot(self) -> RecaptchaMonitorSettings:
         with self._settings_lock:
@@ -1822,19 +1851,61 @@ class RecaptchaMonitor:
             )
 
     def _notify_detected(self, webhook_url: str, user_id: str, screenshot) -> None:
+        self._queue_detected_notification(webhook_url, user_id, screenshot)
+
+    def _queue_detected_notification(self, webhook_url: str, user_id: str, screenshot) -> None:
+        now = time.monotonic()
+        with self._notification_lock:
+            if (
+                self._last_notification_started_at
+                and now - self._last_notification_started_at < RECAPTCHA_NOTIFY_INTERVAL_SECONDS
+            ):
+                return
+            if self._active_notifications >= RECAPTCHA_MAX_NOTIFICATION_WORKERS:
+                return
+            self._last_notification_started_at = now
+            self._active_notifications += 1
+
+        notification_screenshot = screenshot.copy() if hasattr(screenshot, "copy") else screenshot
+        thread = threading.Thread(
+            target=self._send_detected_notification,
+            args=(webhook_url, user_id, notification_screenshot),
+            name="RecaptchaNotification",
+            daemon=True,
+        )
+        try:
+            thread.start()
+        except Exception:
+            with self._notification_lock:
+                self._active_notifications = max(0, self._active_notifications - 1)
+            raise
+
+    def _send_detected_notification(self, webhook_url: str, user_id: str, screenshot) -> None:
+        try:
+            self._post_discord_webhook(webhook_url, user_id, screenshot)
+        except Exception as exc:
+            self._publish_error(f"Discord webhook notification failed: {exc}")
+        else:
+            self._publish("notified", "偵測到測謊，已通知 Discord 並附上截圖。")
+        finally:
+            with self._notification_lock:
+                self._active_notifications = max(0, self._active_notifications - 1)
+
+    def _notify_detected_sync(self, webhook_url: str, user_id: str, screenshot) -> None:
         self._post_discord_webhook(webhook_url, user_id, screenshot)
         self._publish("notified", "偵測到測謊，已通知 Discord 並附上截圖。")
 
     def _post_discord_webhook(self, webhook_url: str, user_id: str, screenshot) -> None:
-        filename = f"recaptcha-detected-{int(time.time())}.png"
+        filename = f"recaptcha-detected-{int(time.time())}.jpg"
         payload = {
             "content": f"<@{user_id}> {DISCORD_NOTIFICATION_TEXT}",
             "allowed_mentions": {"users": [user_id]},
         }
         body, content_type = self._discord_multipart_body(
             payload=payload,
-            screenshot_bytes=self._screenshot_png_bytes(screenshot),
+            screenshot_bytes=self._screenshot_jpeg_bytes(screenshot),
             filename=filename,
+            image_content_type="image/jpeg",
         )
         request = urllib.request.Request(
             webhook_url,
@@ -1858,12 +1929,18 @@ class RecaptchaMonitor:
         screenshot.save(output, format="PNG")
         return output.getvalue()
 
+    def _screenshot_jpeg_bytes(self, screenshot) -> bytes:
+        output = io.BytesIO()
+        screenshot.convert("RGB").save(output, format="JPEG", quality=82)
+        return output.getvalue()
+
     def _discord_multipart_body(
         self,
         *,
         payload: dict,
         screenshot_bytes: bytes,
         filename: str,
+        image_content_type: str = "image/png",
     ) -> tuple[bytes, str]:
         boundary = f"----{APP_NAME}{uuid.uuid4().hex}"
         body = bytearray()
@@ -1881,7 +1958,7 @@ class RecaptchaMonitor:
 
         add_line(f"--{boundary}")
         add_line(f'Content-Disposition: form-data; name="files[0]"; filename="{filename}"')
-        add_line("Content-Type: image/png")
+        add_line(f"Content-Type: {image_content_type}")
         add_line("")
         body.extend(screenshot_bytes)
         body.extend(b"\r\n")
