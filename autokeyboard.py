@@ -42,6 +42,7 @@ APP_TITLE = "AutoKeyboard 腳本精靈"
 APP_NAME = "AutoKeyboard"
 CONFIG_FILENAME = "scripts.json"
 MONITOR_CONFIG_FILENAME = "recaptcha_monitor.json"
+RUNNING_OVERLAY_CONFIG_FILENAME = "running_overlay.json"
 
 
 def app_directory() -> Path:
@@ -67,6 +68,7 @@ def user_data_directory() -> Path:
 LEGACY_CONFIG_PATH = app_directory() / CONFIG_FILENAME
 CONFIG_PATH = user_data_directory() / CONFIG_FILENAME
 MONITOR_CONFIG_PATH = user_data_directory() / MONITOR_CONFIG_FILENAME
+RUNNING_OVERLAY_CONFIG_PATH = user_data_directory() / RUNNING_OVERLAY_CONFIG_FILENAME
 RECAPTCHA_TEMPLATE_PATH = resource_path("assets/check/recaptcha.jpg")
 RECAPTCHA_FULL_TEMPLATE_PATH = resource_path("assets/check/full-recaptcha.png")
 RECAPTCHA_SCAN_INTERVAL_SECONDS = 0.5
@@ -119,15 +121,38 @@ RECAPTCHA_MATCH_SCALES = build_recaptcha_match_scales()
 RECAPTCHA_FOCUS_ROI = (0.06, 0.04, 0.94, 0.98)
 RECAPTCHA_FOCUS_STABLE_SECONDS = 0.3
 RECAPTCHA_ALLOWED_WINDOW_TITLES = ("MapleStory Worlds",)
+WINDOW_EVENT_POLL_INTERVAL_MS = 50
+RUNNING_OVERLAY_OFFSET_X = 8
+RUNNING_OVERLAY_OFFSET_Y = 8
+RUNNING_OVERLAY_ALPHA = 0.72
+RUNNING_OVERLAY_MAX_SCRIPT_NAMES = 6
+RUNNING_OVERLAY_RADIUS = 8
 DISCORD_NOTIFICATION_TEXT = "愣住！你被測謊啦"
 
 
 if platform.system() == "Windows":
     user32 = ctypes.WinDLL("user32", use_last_error=True)
+    gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     user32.GetAsyncKeyState.argtypes = (ctypes.c_int,)
     user32.GetAsyncKeyState.restype = ctypes.c_short
+    WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+    WINEVENTPROC = ctypes.WINFUNCTYPE(
+        None,
+        ctypes.c_void_p,
+        ctypes.c_ulong,
+        ctypes.c_void_p,
+        ctypes.c_long,
+        ctypes.c_long,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+    )
 else:
     user32 = None
+    gdi32 = None
+    kernel32 = None
+    WNDENUMPROC = None
+    WINEVENTPROC = None
 
 
 def configure_process_dpi_awareness() -> None:
@@ -205,7 +230,21 @@ MOD_NOREPEAT = 0x4000
 
 WM_HOTKEY = 0x0312
 PM_REMOVE = 0x0001
+PM_NOREMOVE = 0x0000
+WM_QUIT = 0x0012
 MONITOR_DEFAULTTONEAREST = 0x00000002
+GA_ROOT = 2
+GWL_EXSTYLE = -20
+WS_EX_LAYERED = 0x00080000
+WS_EX_TRANSPARENT = 0x00000020
+WS_EX_TOOLWINDOW = 0x00000080
+WS_EX_NOACTIVATE = 0x08000000
+LWA_COLORKEY = 0x00000001
+LWA_ALPHA = 0x00000002
+EVENT_SYSTEM_FOREGROUND = 0x0003
+EVENT_OBJECT_LOCATIONCHANGE = 0x800B
+OBJID_WINDOW = 0
+WINEVENT_OUTOFCONTEXT = 0x0000
 
 INPUT_KEYBOARD = 1
 KEYEVENTF_KEYUP = 0x0002
@@ -939,6 +978,11 @@ class RecaptchaMonitorSettings:
     only_maplestory_window: bool = True
 
 
+@dataclass
+class RunningOverlaySettings:
+    enabled: bool = True
+
+
 def normalize_discord_user_id(value: str) -> str:
     return "".join(character for character in value.strip() if character.isdigit())
 
@@ -1001,6 +1045,34 @@ def save_recaptcha_monitor_settings(settings: RecaptchaMonitorSettings) -> None:
     }
     MONITOR_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     MONITOR_CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def load_running_overlay_settings() -> RunningOverlaySettings:
+    try:
+        if not RUNNING_OVERLAY_CONFIG_PATH.exists():
+            return RunningOverlaySettings()
+        data = json.loads(RUNNING_OVERLAY_CONFIG_PATH.read_text(encoding="utf-8"))
+        return RunningOverlaySettings(enabled=bool(data.get("enabled", True)))
+    except Exception:
+        return RunningOverlaySettings()
+
+
+def save_running_overlay_settings(settings: RunningOverlaySettings) -> None:
+    data = {"enabled": bool(settings.enabled)}
+    RUNNING_OVERLAY_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    RUNNING_OVERLAY_CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def format_running_overlay_text(script_names: Iterable[str]) -> str:
+    names = [name.strip() for name in script_names if name.strip()]
+    if not names:
+        return ""
+
+    visible_names = names[:RUNNING_OVERLAY_MAX_SCRIPT_NAMES]
+    remaining_count = len(names) - len(visible_names)
+    if remaining_count > 0:
+        visible_names.append(f"... 另 {remaining_count} 個")
+    return "執行中\n" + "\n".join(visible_names)
 
 
 class HotkeyManager:
@@ -1158,6 +1230,260 @@ class MONITORINFO(ctypes.Structure):
         ("rcWork", RECT),
         ("dwFlags", ctypes.c_ulong),
     ]
+
+
+class MapleStoryWindowLocator:
+    def __init__(
+        self,
+        *,
+        allowed_titles: tuple[str, ...] = RECAPTCHA_ALLOWED_WINDOW_TITLES,
+        excluded_pid: int | None = None,
+    ) -> None:
+        if user32 is None or WNDENUMPROC is None:
+            raise RuntimeError("此工具目前只支援 Windows。")
+
+        self._allowed_titles = tuple(token.casefold() for token in allowed_titles if token.strip())
+        self._excluded_pid = excluded_pid
+        self._configure_user32()
+
+    def _configure_user32(self) -> None:
+        user32.GetForegroundWindow.argtypes = ()
+        user32.GetForegroundWindow.restype = ctypes.c_void_p
+        user32.EnumWindows.argtypes = (WNDENUMPROC, ctypes.c_void_p)
+        user32.EnumWindows.restype = ctypes.c_bool
+        user32.GetWindowRect.argtypes = (ctypes.c_void_p, ctypes.POINTER(RECT))
+        user32.GetWindowRect.restype = ctypes.c_bool
+        user32.GetClientRect.argtypes = (ctypes.c_void_p, ctypes.POINTER(RECT))
+        user32.GetClientRect.restype = ctypes.c_bool
+        user32.ClientToScreen.argtypes = (ctypes.c_void_p, ctypes.POINTER(POINT))
+        user32.ClientToScreen.restype = ctypes.c_bool
+        user32.GetWindowTextLengthW.argtypes = (ctypes.c_void_p,)
+        user32.GetWindowTextLengthW.restype = ctypes.c_int
+        user32.GetWindowTextW.argtypes = (ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int)
+        user32.GetWindowTextW.restype = ctypes.c_int
+        user32.GetWindowThreadProcessId.argtypes = (ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong))
+        user32.GetWindowThreadProcessId.restype = ctypes.c_ulong
+        user32.IsWindowVisible.argtypes = (ctypes.c_void_p,)
+        user32.IsWindowVisible.restype = ctypes.c_bool
+        user32.IsIconic.argtypes = (ctypes.c_void_p,)
+        user32.IsIconic.restype = ctypes.c_bool
+
+    def find_window_bbox(self) -> tuple[int, int, int, int] | None:
+        foreground = user32.GetForegroundWindow()
+        if foreground and self._is_candidate_window(int(foreground)):
+            return self._best_bbox_for_window(int(foreground))
+
+        matches: list[tuple[int, tuple[int, int, int, int]]] = []
+
+        def callback(hwnd, _lparam) -> bool:
+            hwnd_value = int(hwnd)
+            if self._is_candidate_window(hwnd_value):
+                bbox = self._best_bbox_for_window(hwnd_value)
+                if bbox is not None:
+                    matches.append((self._bbox_area(bbox), bbox))
+            return True
+
+        callback_ref = WNDENUMPROC(callback)
+        if not user32.EnumWindows(callback_ref, None):
+            return None
+        if not matches:
+            return None
+        return max(matches, key=lambda item: item[0])[1]
+
+    def find_foreground_window_bbox(self) -> tuple[int, int, int, int] | None:
+        foreground = user32.GetForegroundWindow()
+        if not foreground or not self._is_candidate_window(int(foreground)):
+            return None
+        return self._best_bbox_for_window(int(foreground))
+
+    def _is_candidate_window(self, hwnd: int) -> bool:
+        if not user32.IsWindowVisible(hwnd) or user32.IsIconic(hwnd):
+            return False
+        if self._excluded_pid is not None and self._window_process_id(hwnd) == self._excluded_pid:
+            return False
+        if self._allowed_titles:
+            title = self._window_title(hwnd).casefold()
+            if not any(token in title for token in self._allowed_titles):
+                return False
+        return self._best_bbox_for_window(hwnd) is not None
+
+    def _best_bbox_for_window(self, hwnd: int) -> tuple[int, int, int, int] | None:
+        return self._client_bbox(hwnd) or self._window_bbox(hwnd)
+
+    def _client_bbox(self, hwnd: int) -> tuple[int, int, int, int] | None:
+        rect = RECT()
+        if not user32.GetClientRect(hwnd, ctypes.byref(rect)):
+            return None
+        if rect.right <= rect.left or rect.bottom <= rect.top:
+            return None
+
+        top_left = POINT(0, 0)
+        bottom_right = POINT(int(rect.right), int(rect.bottom))
+        if not user32.ClientToScreen(hwnd, ctypes.byref(top_left)):
+            return None
+        if not user32.ClientToScreen(hwnd, ctypes.byref(bottom_right)):
+            return None
+        if bottom_right.x <= top_left.x or bottom_right.y <= top_left.y:
+            return None
+        return (int(top_left.x), int(top_left.y), int(bottom_right.x), int(bottom_right.y))
+
+    def _window_bbox(self, hwnd: int) -> tuple[int, int, int, int] | None:
+        rect = RECT()
+        if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return None
+        if rect.right <= rect.left or rect.bottom <= rect.top:
+            return None
+        return (int(rect.left), int(rect.top), int(rect.right), int(rect.bottom))
+
+    def _window_title(self, hwnd: int) -> str:
+        length = user32.GetWindowTextLengthW(hwnd)
+        if length <= 0:
+            return ""
+        buffer = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(hwnd, buffer, length + 1)
+        return buffer.value
+
+    def _window_process_id(self, hwnd: int) -> int | None:
+        pid = ctypes.c_ulong()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        return int(pid.value) if pid.value else None
+
+    def _bbox_area(self, bbox: tuple[int, int, int, int]) -> int:
+        return max(0, bbox[2] - bbox[0]) * max(0, bbox[3] - bbox[1])
+
+
+class WindowEventHook:
+    def __init__(self) -> None:
+        self.events: queue.Queue[None] = queue.Queue()
+        self._hooks: list[int] = []
+        self._closed = threading.Event()
+        self._ready = threading.Event()
+        self._thread_id = 0
+        self._proc = WINEVENTPROC(self._handle_event) if WINEVENTPROC is not None else None
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if user32 is None or self._proc is None or self._thread is not None:
+            return
+
+        self._thread = threading.Thread(target=self._run, name="WindowEventHook", daemon=True)
+        self._thread.start()
+        self._ready.wait(timeout=1)
+
+    def close(self) -> None:
+        self._closed.set()
+        if user32 is not None and self._thread_id:
+            try:
+                user32.PostThreadMessageW(self._thread_id, WM_QUIT, 0, 0)
+            except Exception:
+                pass
+        if self._thread is not None:
+            self._thread.join(timeout=1)
+
+    def _run(self) -> None:
+        if user32 is None or kernel32 is None or self._proc is None:
+            self._ready.set()
+            return
+
+        try:
+            self._configure_winapi()
+            self._thread_id = int(kernel32.GetCurrentThreadId())
+            self._ensure_message_queue()
+            self._install_hooks()
+            self._ready.set()
+            msg = MSG()
+            while not self._closed.is_set():
+                result = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+                if result <= 0:
+                    break
+                user32.TranslateMessage(ctypes.byref(msg))
+                user32.DispatchMessageW(ctypes.byref(msg))
+        finally:
+            self._uninstall_hooks()
+            self._ready.set()
+
+    def _configure_winapi(self) -> None:
+        kernel32.GetCurrentThreadId.argtypes = ()
+        kernel32.GetCurrentThreadId.restype = ctypes.c_ulong
+        user32.SetWinEventHook.argtypes = (
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+            ctypes.c_void_p,
+            WINEVENTPROC,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+        )
+        user32.SetWinEventHook.restype = ctypes.c_void_p
+        user32.UnhookWinEvent.argtypes = (ctypes.c_void_p,)
+        user32.UnhookWinEvent.restype = ctypes.c_bool
+        user32.GetMessageW.argtypes = (
+            ctypes.POINTER(MSG),
+            ctypes.c_void_p,
+            ctypes.c_uint,
+            ctypes.c_uint,
+        )
+        user32.GetMessageW.restype = ctypes.c_int
+        user32.PostThreadMessageW.argtypes = (ctypes.c_ulong, ctypes.c_uint, ctypes.c_size_t, ctypes.c_ssize_t)
+        user32.PostThreadMessageW.restype = ctypes.c_bool
+        user32.PeekMessageW.argtypes = (
+            ctypes.POINTER(MSG),
+            ctypes.c_void_p,
+            ctypes.c_uint,
+            ctypes.c_uint,
+            ctypes.c_uint,
+        )
+        user32.PeekMessageW.restype = ctypes.c_bool
+        user32.TranslateMessage.argtypes = (ctypes.POINTER(MSG),)
+        user32.DispatchMessageW.argtypes = (ctypes.POINTER(MSG),)
+
+    def _ensure_message_queue(self) -> None:
+        msg = MSG()
+        user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, PM_NOREMOVE)
+
+    def _install_hooks(self) -> None:
+        for event_min, event_max in (
+            (EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND),
+            (EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE),
+        ):
+            hook = user32.SetWinEventHook(
+                event_min,
+                event_max,
+                None,
+                self._proc,
+                0,
+                0,
+                WINEVENT_OUTOFCONTEXT,
+            )
+            if hook:
+                self._hooks.append(int(hook))
+
+    def _uninstall_hooks(self) -> None:
+        for hook in self._hooks:
+            try:
+                user32.UnhookWinEvent(hook)
+            except Exception:
+                pass
+        self._hooks.clear()
+
+    def _handle_event(
+        self,
+        _hook,
+        event: int,
+        _hwnd,
+        object_id: int,
+        _child_id: int,
+        _event_thread: int,
+        _event_time: int,
+    ) -> None:
+        if self._closed.is_set():
+            return
+        if event == EVENT_OBJECT_LOCATIONCHANGE and object_id != OBJID_WINDOW:
+            return
+        try:
+            self.events.put_nowait(None)
+        except queue.Full:
+            pass
 
 
 @dataclass
@@ -2269,6 +2595,290 @@ class RoundedEntry(tk.Frame):
         self.entry.selection_range(start, end)
 
 
+class RunningScriptsOverlay:
+    _transparent_color = "#ff00ff"
+    _bg = "#0f172a"
+    _fg = "#f8fafc"
+    _pad_x = 12
+    _pad_y = 8
+    _text_width = 340
+
+    def __init__(self, root: tk.Tk, on_moved=None) -> None:
+        self._on_moved = on_moved
+        self._window = tk.Toplevel(root)
+        self._window.withdraw()
+        self._window.overrideredirect(True)
+        self._window.configure(bg=self._transparent_color)
+        self._window.resizable(False, False)
+        try:
+            self._window.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+
+        self._canvas = tk.Canvas(self._window, bg=self._transparent_color, bd=0, highlightthickness=0)
+        self._canvas.pack(fill="both", expand=True)
+        self._text_item = self._canvas.create_text(
+            self._pad_x,
+            self._pad_y,
+            anchor="nw",
+            fill=self._fg,
+            font=("Microsoft JhengHei UI", 10, "bold"),
+            justify="left",
+            text="",
+            width=self._text_width,
+        )
+        self._content_size = (1, 1)
+        self._last_text = ""
+        self._last_geometry = ""
+        self._drag_start_pointer: tuple[int, int] | None = None
+        self._drag_start_window: tuple[int, int] | None = None
+        self._drag_bounds: tuple[int, int, int, int] | None = None
+        self._dragging = False
+        self._bind_drag_handlers()
+        self._configure_window_style()
+
+    def show(
+        self,
+        text: str,
+        x: int,
+        y: int,
+        bounds: tuple[int, int, int, int] | None = None,
+    ) -> None:
+        if not text:
+            self.hide()
+            return
+
+        self._drag_bounds = bounds
+        width, height = self._set_text(text)
+        x, y = self._clamp_position(x, y, width, height, bounds)
+        geometry = f"{width}x{height}+{x}+{y}"
+        if geometry != self._last_geometry:
+            self._window.geometry(geometry)
+            self._window.update_idletasks()
+            self._last_geometry = geometry
+            self._configure_window_style()
+            self._apply_rounded_region(width, height)
+
+        if not self._window.winfo_viewable():
+            self._window.deiconify()
+            self._window.update_idletasks()
+            self._configure_window_style()
+            self._apply_rounded_region(width, height)
+
+    def hide(self) -> None:
+        try:
+            if not self._window.winfo_viewable():
+                return
+            self._window.withdraw()
+            self._last_geometry = ""
+        except tk.TclError:
+            pass
+
+    def destroy(self) -> None:
+        try:
+            self._window.destroy()
+        except tk.TclError:
+            pass
+
+    def is_interacting_or_foreground(self) -> bool:
+        return self._dragging or self.is_foreground()
+
+    def is_foreground(self) -> bool:
+        if user32 is None:
+            return False
+
+        try:
+            foreground = user32.GetForegroundWindow()
+            return bool(foreground) and int(foreground) == self._top_level_hwnd()
+        except Exception:
+            return False
+
+    def _set_text(self, text: str) -> tuple[int, int]:
+        if text == self._last_text:
+            return self._content_size
+
+        self._last_text = text
+        self._canvas.itemconfigure(self._text_item, text=text)
+        bbox = self._canvas.bbox(self._text_item) or (0, 0, 1, 1)
+        width = max(80, int(bbox[2] - bbox[0] + self._pad_x * 2))
+        height = max(34, int(bbox[3] - bbox[1] + self._pad_y * 2))
+        self._canvas.configure(width=width, height=height)
+        self._redraw_background(width, height)
+        self._canvas.coords(self._text_item, self._pad_x, self._pad_y)
+        self._canvas.tag_raise(self._text_item)
+        self._content_size = (width, height)
+        return self._content_size
+
+    def _redraw_background(self, width: int, height: int) -> None:
+        self._canvas.delete("overlay_bg")
+        radius = max(1, min(RUNNING_OVERLAY_RADIUS, width // 2, height // 2))
+        diameter = radius * 2
+        items = [
+            self._canvas.create_rectangle(radius, 0, width - radius, height, fill=self._bg, outline="", tags="overlay_bg"),
+            self._canvas.create_rectangle(0, radius, width, height - radius, fill=self._bg, outline="", tags="overlay_bg"),
+            self._canvas.create_oval(0, 0, diameter, diameter, fill=self._bg, outline="", tags="overlay_bg"),
+            self._canvas.create_oval(width - diameter, 0, width, diameter, fill=self._bg, outline="", tags="overlay_bg"),
+            self._canvas.create_oval(0, height - diameter, diameter, height, fill=self._bg, outline="", tags="overlay_bg"),
+            self._canvas.create_oval(
+                width - diameter,
+                height - diameter,
+                width,
+                height,
+                fill=self._bg,
+                outline="",
+                tags="overlay_bg",
+            ),
+        ]
+        for item in items:
+            self._canvas.tag_lower(item)
+
+    def _bind_drag_handlers(self) -> None:
+        for widget in (self._window, self._canvas):
+            widget.bind("<ButtonPress-1>", self._start_drag)
+            widget.bind("<B1-Motion>", self._drag)
+            widget.bind("<ButtonRelease-1>", self._finish_drag)
+
+    def _start_drag(self, event: tk.Event) -> str:
+        self._dragging = True
+        self._drag_start_pointer = (int(event.x_root), int(event.y_root))
+        self._drag_start_window = (self._window.winfo_x(), self._window.winfo_y())
+        return "break"
+
+    def _drag(self, event: tk.Event) -> str:
+        if self._drag_start_pointer is None or self._drag_start_window is None:
+            return "break"
+
+        dx = int(event.x_root) - self._drag_start_pointer[0]
+        dy = int(event.y_root) - self._drag_start_pointer[1]
+        x = self._drag_start_window[0] + dx
+        y = self._drag_start_window[1] + dy
+        width, height = self._content_size
+        x, y = self._clamp_position(x, y, width, height, self._drag_bounds)
+        geometry = f"{width}x{height}+{x}+{y}"
+        if geometry != self._last_geometry:
+            self._window.geometry(geometry)
+            self._last_geometry = geometry
+        if self._on_moved is not None:
+            self._on_moved(x, y)
+        return "break"
+
+    def _finish_drag(self, event: tk.Event) -> str:
+        if self._on_moved is not None and self._window.winfo_viewable():
+            self._on_moved(self._window.winfo_x(), self._window.winfo_y())
+        self._dragging = False
+        self._drag_start_pointer = None
+        self._drag_start_window = None
+        return "break"
+
+    def _clamp_position(
+        self,
+        x: int,
+        y: int,
+        width: int,
+        height: int,
+        bounds: tuple[int, int, int, int] | None,
+    ) -> tuple[int, int]:
+        if bounds is None:
+            return x, y
+
+        left, top, right, bottom = bounds
+        max_x = max(left, right - width)
+        max_y = max(top, bottom - height)
+        return min(max(x, left), max_x), min(max(y, top), max_y)
+
+    def _configure_window_style(self) -> None:
+        if user32 is None:
+            return
+
+        try:
+            hwnd = self._top_level_hwnd()
+            get_window_long = getattr(user32, "GetWindowLongPtrW", None) or user32.GetWindowLongW
+            set_window_long = getattr(user32, "SetWindowLongPtrW", None) or user32.SetWindowLongW
+            get_window_long.argtypes = (ctypes.c_void_p, ctypes.c_int)
+            get_window_long.restype = ctypes.c_ssize_t
+            set_window_long.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.c_ssize_t)
+            set_window_long.restype = ctypes.c_ssize_t
+            style = int(get_window_long(hwnd, GWL_EXSTYLE))
+            style = (style | WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE) & ~WS_EX_TRANSPARENT
+            set_window_long(hwnd, GWL_EXSTYLE, style)
+            self._set_layered_attributes(hwnd)
+        except Exception:
+            pass
+
+    def _apply_rounded_region(self, width: int, height: int) -> None:
+        if user32 is None or gdi32 is None:
+            return
+
+        try:
+            hwnd = self._top_level_hwnd()
+            diameter = RUNNING_OVERLAY_RADIUS * 2
+            gdi32.CreateRoundRectRgn.argtypes = (
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+            )
+            gdi32.CreateRoundRectRgn.restype = ctypes.c_void_p
+            user32.SetWindowRgn.argtypes = (ctypes.c_void_p, ctypes.c_void_p, ctypes.c_bool)
+            user32.SetWindowRgn.restype = ctypes.c_int
+            gdi32.DeleteObject.argtypes = (ctypes.c_void_p,)
+            gdi32.DeleteObject.restype = ctypes.c_bool
+
+            region = gdi32.CreateRoundRectRgn(0, 0, width + 1, height + 1, diameter, diameter)
+            if region and not user32.SetWindowRgn(hwnd, region, True):
+                gdi32.DeleteObject(region)
+        except Exception:
+            pass
+
+    def _top_level_hwnd(self) -> int:
+        hwnd = int(self._window.winfo_id())
+        if user32 is None:
+            return hwnd
+
+        try:
+            user32.GetAncestor.argtypes = (ctypes.c_void_p, ctypes.c_uint)
+            user32.GetAncestor.restype = ctypes.c_void_p
+            root_hwnd = user32.GetAncestor(hwnd, GA_ROOT)
+            return int(root_hwnd or hwnd)
+        except Exception:
+            return hwnd
+
+    def _set_layered_attributes(self, hwnd: int) -> None:
+        if user32 is None:
+            return
+
+        try:
+            user32.SetLayeredWindowAttributes.argtypes = (
+                ctypes.c_void_p,
+                ctypes.c_ulong,
+                ctypes.c_ubyte,
+                ctypes.c_ulong,
+            )
+            user32.SetLayeredWindowAttributes.restype = ctypes.c_bool
+            alpha = max(0, min(255, int(round(RUNNING_OVERLAY_ALPHA * 255))))
+            user32.SetLayeredWindowAttributes(
+                hwnd,
+                self._color_ref(self._transparent_color),
+                alpha,
+                LWA_COLORKEY | LWA_ALPHA,
+            )
+        except Exception:
+            try:
+                self._window.attributes("-alpha", RUNNING_OVERLAY_ALPHA)
+                self._window.attributes("-transparentcolor", self._transparent_color)
+            except tk.TclError:
+                pass
+
+    def _color_ref(self, color: str) -> int:
+        color = color.lstrip("#")
+        red = int(color[0:2], 16)
+        green = int(color[2:4], 16)
+        blue = int(color[4:6], 16)
+        return red | (green << 8) | (blue << 16)
+
+
 class AutoKeyboardApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -2279,11 +2889,14 @@ class AutoKeyboardApp:
 
         self.scripts = load_scripts()
         self.recaptcha_settings = load_recaptcha_monitor_settings()
+        self.running_overlay_settings = load_running_overlay_settings()
         self.keyboard = WindowsKeyboard()
         self.hotkeys = HotkeyManager()
         self.runtime_events: queue.Queue[tuple] = queue.Queue()
         self.monitor_events: queue.Queue[tuple[str, str]] = queue.Queue()
         self.recaptcha_monitor = RecaptchaMonitor(self.monitor_events, excluded_pid=os.getpid())
+        self.maplestory_window_locator = MapleStoryWindowLocator(excluded_pid=os.getpid())
+        self.window_event_hook = WindowEventHook()
         self.runners: dict[str, ScriptRunner] = {}
         self.current_step: dict[str, str] = {}
         self._loading_script = False
@@ -2296,6 +2909,10 @@ class AutoKeyboardApp:
         self._hotkey_register_after_id: str | None = None
         self._recaptcha_save_after_id: str | None = None
         self._poll_after_id: str | None = None
+        self._window_event_after_id: str | None = None
+        self._running_overlay_offset = (RUNNING_OVERLAY_OFFSET_X, RUNNING_OVERLAY_OFFSET_Y)
+        self._running_overlay_window_size: tuple[int, int] | None = None
+        self._running_overlay_window_bbox: tuple[int, int, int, int] | None = None
         self._script_drag_start_y: int | None = None
         self._script_drag_start_id: str | None = None
         self._script_dragging = False
@@ -2321,6 +2938,7 @@ class AutoKeyboardApp:
         self.step_key_var = tk.StringVar(value="SPACE")
         self.step_delay_ms_var = tk.StringVar(value="1,000")
         self.step_script_var = tk.StringVar()
+        self.running_overlay_enabled_var = tk.BooleanVar(value=self.running_overlay_settings.enabled)
         self.recaptcha_enabled_var = tk.BooleanVar(value=self.recaptcha_settings.enabled)
         self.recaptcha_maplestory_only_var = tk.BooleanVar(value=self.recaptcha_settings.only_maplestory_window)
         self.recaptcha_recipient_name_var = tk.StringVar(value=self.recaptcha_settings.recipient_name)
@@ -2332,6 +2950,7 @@ class AutoKeyboardApp:
 
         self._configure_style()
         self._build_ui()
+        self.running_overlay = RunningScriptsOverlay(self.root, on_moved=self._on_running_overlay_moved)
         self._bind_auto_save()
         self._refresh_recaptcha_binding_display()
         self.recaptcha_monitor.set_settings(self.recaptcha_settings)
@@ -2340,7 +2959,10 @@ class AutoKeyboardApp:
         self._refresh_script_tree()
         self._select_first_script()
         self._register_hotkeys(show_dialog=False)
+        self.window_event_hook.start()
         self._poll_events()
+        self._poll_window_events()
+        self._sync_running_overlay()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _set_window_icon(self) -> None:
@@ -2576,9 +3198,18 @@ class AutoKeyboardApp:
         )
         self.toggle_button.grid(row=1, column=2, sticky="ew", padx=(4, 0), pady=(8, 0))
 
-        ttk.Separator(left).grid(row=3, column=0, sticky="ew", pady=(14, 10))
+        overlay_frame = ttk.Frame(left, style="Panel.TFrame")
+        overlay_frame.grid(row=3, column=0, sticky="ew", pady=(12, 0))
+        ttk.Checkbutton(
+            overlay_frame,
+            text="顯示腳本懸浮提示",
+            variable=self.running_overlay_enabled_var,
+            command=self._on_running_overlay_toggled,
+        ).grid(row=0, column=0, sticky="w")
+
+        ttk.Separator(left).grid(row=4, column=0, sticky="ew", pady=(14, 10))
         monitor_frame = ttk.Frame(left, style="Panel.TFrame")
-        monitor_frame.grid(row=4, column=0, sticky="ew")
+        monitor_frame.grid(row=5, column=0, sticky="ew")
         monitor_frame.columnconfigure(1, weight=1)
 
         ttk.Label(monitor_frame, text="測謊偵測", style="Title.TLabel").grid(
@@ -2944,6 +3575,7 @@ class AutoKeyboardApp:
                 self.script_tree.focus(selected)
 
         self._update_banner()
+        self._sync_running_overlay()
         self._update_toggle_button()
         self._refresh_script_call_choices()
 
@@ -3116,13 +3748,103 @@ class AutoKeyboardApp:
         return ()
 
     def _update_banner(self) -> None:
-        running_names = [script.name for script in self.scripts if script.id in self.runners]
+        running_names = self._running_script_names()
         if running_names:
             self.banner_var.set("執行中：" + "、".join(running_names))
             self.banner_label.configure(style="Banner.Running.TLabel")
         else:
             self.banner_var.set("待命")
             self.banner_label.configure(style="Banner.Idle.TLabel")
+
+    def _running_script_names(self) -> list[str]:
+        return [script.name for script in self.scripts if script.id in self.runners]
+
+    def _sync_running_overlay(self) -> None:
+        if not hasattr(self, "running_overlay"):
+            return
+        if not bool(self.running_overlay_enabled_var.get()):
+            self.running_overlay.hide()
+            return
+
+        text = format_running_overlay_text(self._running_script_names())
+        if not text:
+            self.running_overlay.hide()
+            return
+
+        try:
+            bbox = self.maplestory_window_locator.find_foreground_window_bbox()
+        except Exception:
+            bbox = None
+        if bbox is None:
+            if self.running_overlay.is_interacting_or_foreground():
+                bbox = self._running_overlay_window_bbox
+            if bbox is None:
+                self._running_overlay_window_bbox = None
+                self.running_overlay.hide()
+                return
+        else:
+            self._running_overlay_window_bbox = bbox
+
+        window_size = (bbox[2] - bbox[0], bbox[3] - bbox[1])
+        if window_size != self._running_overlay_window_size:
+            self._running_overlay_window_size = window_size
+            self._running_overlay_offset = (RUNNING_OVERLAY_OFFSET_X, RUNNING_OVERLAY_OFFSET_Y)
+
+        offset_x, offset_y = self._running_overlay_offset
+        self.running_overlay.show(
+            text,
+            bbox[0] + offset_x,
+            bbox[1] + offset_y,
+            bounds=bbox,
+        )
+
+    def _on_running_overlay_moved(self, x: int, y: int) -> None:
+        try:
+            bbox = self.maplestory_window_locator.find_foreground_window_bbox()
+        except Exception:
+            bbox = None
+        if bbox is None:
+            bbox = self._running_overlay_window_bbox
+        if bbox is None:
+            return
+
+        self._running_overlay_window_bbox = bbox
+
+        self._running_overlay_window_size = (bbox[2] - bbox[0], bbox[3] - bbox[1])
+        self._running_overlay_offset = (x - bbox[0], y - bbox[1])
+
+    def _poll_window_events(self) -> None:
+        if self._closing:
+            return
+
+        self._window_event_after_id = None
+        should_sync = False
+        while True:
+            try:
+                self.window_event_hook.events.get_nowait()
+            except queue.Empty:
+                break
+            should_sync = True
+
+        if should_sync:
+            self._sync_running_overlay()
+
+        self._window_event_after_id = self.root.after(
+            WINDOW_EVENT_POLL_INTERVAL_MS,
+            self._poll_window_events,
+        )
+
+    def _on_running_overlay_toggled(self) -> None:
+        enabled = bool(self.running_overlay_enabled_var.get())
+        self.running_overlay_settings = RunningOverlaySettings(enabled=enabled)
+        try:
+            save_running_overlay_settings(self.running_overlay_settings)
+        except Exception as exc:
+            self.status_var.set(f"儲存腳本懸浮提示設定失敗：{exc}")
+        else:
+            state = "開啟" if enabled else "關閉"
+            self.status_var.set(f"已{state}腳本懸浮提示。")
+        self._sync_running_overlay()
 
     def _update_toggle_button(self) -> None:
         script_id = self._selected_script_id()
@@ -4449,6 +5171,7 @@ class AutoKeyboardApp:
             self._auto_save_step_after_id,
             self._hotkey_register_after_id,
             self._recaptcha_save_after_id,
+            self._window_event_after_id,
             self._step_drag_pulse_after_id,
         ):
             if after_id is None:
@@ -4463,12 +5186,15 @@ class AutoKeyboardApp:
 
         for runner in list(self.runners.values()):
             runner.stop()
+        self.window_event_hook.close()
+        self.running_overlay.hide()
         self.recaptcha_monitor.close()
         self.hotkeys.close()
         deadline = time.monotonic() + 1.0
         for runner in list(self.runners.values()):
             remaining = deadline - time.monotonic()
             runner.join(max(remaining, 0.0))
+        self.running_overlay.destroy()
         self.root.destroy()
 
 

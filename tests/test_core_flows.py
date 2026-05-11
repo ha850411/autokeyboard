@@ -239,6 +239,30 @@ class ConfigPersistenceTests(unittest.TestCase):
 
         self.assertEqual(loaded, ak.RecaptchaMonitorSettings())
 
+    def test_running_overlay_settings_round_trip_and_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            settings_path = Path(directory) / "running_overlay.json"
+
+            with patch.object(ak, "RUNNING_OVERLAY_CONFIG_PATH", settings_path):
+                self.assertEqual(ak.load_running_overlay_settings(), ak.RunningOverlaySettings())
+
+                ak.save_running_overlay_settings(ak.RunningOverlaySettings(enabled=False))
+                loaded = ak.load_running_overlay_settings()
+                saved_data = ak.json.loads(settings_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(loaded, ak.RunningOverlaySettings(enabled=False))
+        self.assertEqual(saved_data, {"enabled": False})
+
+    def test_running_overlay_settings_invalid_config_returns_default(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            settings_path = Path(directory) / "running_overlay.json"
+            settings_path.write_text("{not json", encoding="utf-8")
+
+            with patch.object(ak, "RUNNING_OVERLAY_CONFIG_PATH", settings_path):
+                loaded = ak.load_running_overlay_settings()
+
+        self.assertEqual(loaded, ak.RunningOverlaySettings())
+
     def test_normalize_discord_user_id_keeps_digits_only(self) -> None:
         self.assertEqual(ak.normalize_discord_user_id(" <@123-abc-456> "), "123456")
 
@@ -268,6 +292,21 @@ class TimeFormattingTests(unittest.TestCase):
         self.assertEqual(ak.format_delay_ms(1250), "1.25 秒")
         self.assertEqual(ak.format_delay_ms(60_000), "1 分鐘")
         self.assertEqual(ak.format_delay_ms(61_500), "1 分鐘 1.5 秒")
+
+
+class RunningOverlayTextTests(unittest.TestCase):
+    def test_formats_running_script_names_for_overlay(self) -> None:
+        self.assertEqual(ak.format_running_overlay_text([]), "")
+        self.assertEqual(ak.format_running_overlay_text([" 炒麵(十分鐘) "]), "執行中\n炒麵(十分鐘)")
+
+    def test_limits_running_script_names_for_overlay(self) -> None:
+        names = [f"腳本{i}" for i in range(1, ak.RUNNING_OVERLAY_MAX_SCRIPT_NAMES + 3)]
+
+        text = ak.format_running_overlay_text(names)
+
+        self.assertIn("腳本1", text)
+        self.assertIn(f"腳本{ak.RUNNING_OVERLAY_MAX_SCRIPT_NAMES}", text)
+        self.assertIn("... 另 2 個", text)
 
 
 class FakeKeyboard:
