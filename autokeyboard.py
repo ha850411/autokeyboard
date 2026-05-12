@@ -69,26 +69,36 @@ LEGACY_CONFIG_PATH = app_directory() / CONFIG_FILENAME
 CONFIG_PATH = user_data_directory() / CONFIG_FILENAME
 MONITOR_CONFIG_PATH = user_data_directory() / MONITOR_CONFIG_FILENAME
 RUNNING_OVERLAY_CONFIG_PATH = user_data_directory() / RUNNING_OVERLAY_CONFIG_FILENAME
-RECAPTCHA_TEMPLATE_PATH = resource_path("assets/check/recaptcha.jpg")
-RECAPTCHA_FULL_TEMPLATE_PATH = resource_path("assets/check/full-recaptcha.png")
+RECAPTCHA_TEMPLATE_PATH = resource_path("assets/check/recaptcha.png")
 RECAPTCHA_SCAN_INTERVAL_SECONDS = 0.5
 RECAPTCHA_FEATURE_SCAN_INTERVAL_SECONDS = 0.33
+RECAPTCHA_UNMATCHED_FEATURE_SCAN_INTERVAL_SECONDS = 0.75
 RECAPTCHA_CONFIRM_SECONDS = 0.6
 RECAPTCHA_MATCH_DOWNSAMPLE = 0.5
 RECAPTCHA_FULL_RES_MAX_PIXELS = 1_000_000
+RECAPTCHA_MIN_DOWNSAMPLED_DIMENSION = 96
 RECAPTCHA_MATCH_THRESHOLD = 22.0
 RECAPTCHA_CV_MATCH_THRESHOLD = 0.94
-RECAPTCHA_FULL_CV_MATCH_THRESHOLD = 0.90
+RECAPTCHA_MASKED_CV_MATCH_THRESHOLD = 0.90
+RECAPTCHA_RELAXED_MASKED_CCORR_THRESHOLD = 0.91
+RECAPTCHA_RELAXED_MASKED_SCALE_MIN = 0.7
+RECAPTCHA_RELAXED_MASKED_SCALE_LIMIT = 8
 RECAPTCHA_TINY_CV_MATCH_THRESHOLD = 0.88
 RECAPTCHA_SMALL_CV_MATCH_THRESHOLD = 0.9
+RECAPTCHA_TINY_MASKED_CV_MATCH_THRESHOLD = 0.86
+RECAPTCHA_SMALL_MASKED_CV_MATCH_THRESHOLD = 0.88
 RECAPTCHA_VERIFY_MEAN_THRESHOLD = 20.0
 RECAPTCHA_VERIFY_GOOD_PIXEL_THRESHOLD = 42.0
 RECAPTCHA_VERIFY_GOOD_PIXEL_RATIO = 0.88
 RECAPTCHA_MATCH_SCALE_MIN = 0.12
 RECAPTCHA_MATCH_SCALE_MAX = 2.0
 RECAPTCHA_MATCH_SCALE_STEP_RATIO = 1.035
+RECAPTCHA_COARSE_MATCH_SCALE_STEP_RATIO = 1.07
+RECAPTCHA_FINE_MATCH_SCALE_WINDOW_RATIO = 0.04
+RECAPTCHA_MASKED_PRIORITY_SCALE_LIMIT = 8
+RECAPTCHA_MASKED_SMALL_SCALE_MAX = 0.5
 RECAPTCHA_PREFERRED_MATCH_SCALE = 1.0
-RECAPTCHA_FULL_MATCH_SCALE_WINDOW_RATIO = 0.15
+RECAPTCHA_WARM_UP_SCALE_LIMIT = 18
 RECAPTCHA_NOTIFY_INTERVAL_SECONDS = 2.0
 RECAPTCHA_MAX_NOTIFICATION_WORKERS = 3
 DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
@@ -126,6 +136,8 @@ WINDOW_EVENT_POLL_INTERVAL_MS = 50
 RUNNING_OVERLAY_OFFSET_X = 8
 RUNNING_OVERLAY_OFFSET_Y = 8
 RUNNING_OVERLAY_ALPHA = 0.72
+RUNNING_OVERLAY_MIN_ALPHA = 0.2
+RUNNING_OVERLAY_MAX_ALPHA = 1.0
 RUNNING_OVERLAY_MAX_SCRIPT_NAMES = 6
 RUNNING_OVERLAY_RADIUS = 8
 DISCORD_NOTIFICATION_TEXT = "愣住！你被測謊啦"
@@ -982,6 +994,7 @@ class RecaptchaMonitorSettings:
 @dataclass
 class RunningOverlaySettings:
     enabled: bool = True
+    opacity: float = RUNNING_OVERLAY_ALPHA
 
 
 def normalize_discord_user_id(value: str) -> str:
@@ -1048,18 +1061,38 @@ def save_recaptcha_monitor_settings(settings: RecaptchaMonitorSettings) -> None:
     MONITOR_CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def clamp_running_overlay_opacity(value: float) -> float:
+    try:
+        opacity = float(value)
+    except (TypeError, ValueError):
+        return RUNNING_OVERLAY_ALPHA
+    if opacity != opacity:
+        return RUNNING_OVERLAY_ALPHA
+    return max(RUNNING_OVERLAY_MIN_ALPHA, min(RUNNING_OVERLAY_MAX_ALPHA, opacity))
+
+
+def format_running_overlay_opacity_label(value: float) -> str:
+    return f"{int(round(clamp_running_overlay_opacity(value) * 100))}%"
+
+
 def load_running_overlay_settings() -> RunningOverlaySettings:
     try:
         if not RUNNING_OVERLAY_CONFIG_PATH.exists():
             return RunningOverlaySettings()
         data = json.loads(RUNNING_OVERLAY_CONFIG_PATH.read_text(encoding="utf-8"))
-        return RunningOverlaySettings(enabled=bool(data.get("enabled", True)))
+        return RunningOverlaySettings(
+            enabled=bool(data.get("enabled", True)),
+            opacity=clamp_running_overlay_opacity(data.get("opacity", RUNNING_OVERLAY_ALPHA)),
+        )
     except Exception:
         return RunningOverlaySettings()
 
 
 def save_running_overlay_settings(settings: RunningOverlaySettings) -> None:
-    data = {"enabled": bool(settings.enabled)}
+    data = {
+        "enabled": bool(settings.enabled),
+        "opacity": clamp_running_overlay_opacity(settings.opacity),
+    }
     RUNNING_OVERLAY_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     RUNNING_OVERLAY_CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -1488,12 +1521,23 @@ class WindowEventHook:
 
 
 @dataclass
+class TemplateColorProfile:
+    bright_ratio: float
+    blue_ratio: float
+    saturated_ratio: float
+    saturated_not_blue_ratio: float
+    dark_ratio: float
+
+
+@dataclass
 class PreparedTemplate:
     image: object
     samples: list[tuple[int, int, int, int, int]]
     gray: object | None = None
+    mask: object | None = None
     important_mask: object | None = None
     blue_mask: object | None = None
+    color_profile: TemplateColorProfile | None = None
     important_samples: list[tuple[int, int, int, int, int]] = field(default_factory=list)
     scale: float = 1.0
 
@@ -1669,22 +1713,20 @@ class ImageTemplateMatcher:
         downsample: float = RECAPTCHA_MATCH_DOWNSAMPLE,
         threshold: float = RECAPTCHA_MATCH_THRESHOLD,
         scales: tuple[float, ...] | None = None,
-        profile: str = "compact",
     ) -> None:
         if Image is None or ImageChops is None or ImageStat is None:
             raise RuntimeError("缺少 Pillow，請先安裝 Pillow 才能讀取與比對圖片。")
         if not template_path.exists():
             raise FileNotFoundError(f"找不到比對圖片：{template_path}")
-        if profile not in {"compact", "full"}:
-            raise ValueError(f"不支援的比對模式：{profile}")
 
         self._downsample = downsample
         self._threshold = threshold
         self._cv_threshold = RECAPTCHA_CV_MATCH_THRESHOLD
         self._scales = scales
-        self._profile = profile
         self._resample = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
-        self._template = Image.open(template_path).convert("RGB")
+        self._template_rgba = Image.open(template_path).convert("RGBA")
+        self._template = self._template_rgba.convert("RGB")
+        self._template_alpha = self._template_rgba.getchannel("A")
         self._templates_by_downsample_scale: dict[tuple[float, float], PreparedTemplate] = {}
         self._last_match_scale: float | None = None
 
@@ -1698,6 +1740,7 @@ class ImageTemplateMatcher:
         scales: tuple[float, ...] | None = None,
     ) -> None:
         warm_scales = scales or self._scales or RECAPTCHA_MATCH_SCALES
+        warm_scales = self._prioritized_scales(warm_scales)[:RECAPTCHA_WARM_UP_SCALE_LIMIT]
         seen_downsamples: set[float] = set()
         for downsample in downsample_values:
             if downsample <= 0:
@@ -1729,13 +1772,15 @@ class ImageTemplateMatcher:
 
         scales = self._scales_for_screenshot(screenshot)
         scales = self._scales_near_preferred(scales, preferred_scale, scale_window_ratio)
-        templates = self._templates_for_downsample(downsample, scales)
-        templates = self._prioritized_templates(templates, preferred_scale)
+        scales = self._prioritized_scales(scales, preferred_scale)
 
         if cv2 is not None and np is not None:
-            return self._remember_match_scale(self._match_with_cv(small_screenshot, templates))
+            return self._remember_match_scale(
+                self._match_with_cv(small_screenshot, downsample, scales, preferred_scale=preferred_scale)
+            )
 
-        for prepared in templates:
+        for scale in scales:
+            prepared = self._template_for_downsample_scale(downsample, scale)
             if self._contains_template(small_screenshot, prepared):
                 return self._remember_match_scale(
                     ImageMatchResult(matched=True, has_features=True, match_scale=prepared.scale)
@@ -1750,9 +1795,13 @@ class ImageTemplateMatcher:
     def _effective_downsample(self, screenshot) -> float:
         if cv2 is None or np is None:
             return self._downsample
-        if screenshot.width * screenshot.height <= RECAPTCHA_FULL_RES_MAX_PIXELS:
+        downsample = min(1.0, self._downsample) if self._downsample > 0 else 1.0
+        if downsample >= 1.0:
             return 1.0
-        return self._downsample
+        if screenshot.width * screenshot.height <= RECAPTCHA_FULL_RES_MAX_PIXELS:
+            if min(screenshot.width, screenshot.height) * downsample < RECAPTCHA_MIN_DOWNSAMPLED_DIMENSION:
+                return 1.0
+        return downsample
 
     def _scales_for_screenshot(self, screenshot) -> tuple[float, ...]:
         if self._scales is not None:
@@ -1794,10 +1843,15 @@ class ImageTemplateMatcher:
         blue = pixels[:, :, 2].astype(np.int16)
         bright_pixels = (red > 210) & (green > 210) & (blue > 210)
         button_blue_pixels = (blue > 140) & (green > 70) & (green < 210) & (red < 140) & ((blue - red) > 45)
+        saturated_pixels = (np.maximum.reduce((red, green, blue)) - np.minimum.reduce((red, green, blue))) > 70
         area = screenshot.width * screenshot.height
         min_bright_pixels = max(80, int(area * 0.0004))
         min_blue_pixels = max(24, int(area * 0.00015))
-        return int(bright_pixels.sum()) >= min_bright_pixels and int(button_blue_pixels.sum()) >= min_blue_pixels
+        min_saturated_pixels = max(18, int(area * 0.00005))
+        return (
+            int(bright_pixels.sum()) >= min_bright_pixels
+            and int(button_blue_pixels.sum()) >= min_blue_pixels
+        ) or int(saturated_pixels.sum()) >= min_saturated_pixels
 
     def _templates_for_downsample(self, downsample: float, scales: tuple[float, ...]) -> list[PreparedTemplate]:
         normalized_downsample = round(downsample, 3)
@@ -1817,10 +1871,24 @@ class ImageTemplateMatcher:
         templates: list[PreparedTemplate],
         preferred_scale: float | None,
     ) -> list[PreparedTemplate]:
-        scale_hint = preferred_scale or self._last_match_scale or RECAPTCHA_PREFERRED_MATCH_SCALE
+        scale_hint = self._scale_hint(preferred_scale)
         if scale_hint <= 0:
             return templates
         return sorted(templates, key=lambda template: (abs(template.scale - scale_hint), template.scale))
+
+    def _prioritized_scales(
+        self,
+        scales: tuple[float, ...],
+        preferred_scale: float | None = None,
+    ) -> tuple[float, ...]:
+        scale_hint = self._scale_hint(preferred_scale)
+        if scale_hint <= 0:
+            return scales
+        return tuple(sorted(scales, key=lambda scale: (abs(scale - scale_hint), scale)))
+
+    def _scale_hint(self, preferred_scale: float | None = None) -> float:
+        scale_hint = preferred_scale or self._last_match_scale or RECAPTCHA_PREFERRED_MATCH_SCALE
+        return scale_hint
 
     def _prepare_templates(self, scales: tuple[float, ...], downsample: float) -> list[PreparedTemplate]:
         return [self._template_for_downsample_scale(downsample, scale) for scale in scales]
@@ -1829,40 +1897,88 @@ class ImageTemplateMatcher:
         width = max(1, int(self._template.width * scale * downsample))
         height = max(1, int(self._template.height * scale * downsample))
         image = self._template.resize((width, height), self._resample)
+        mask_image = self._template_alpha.resize((width, height), self._resample)
         gray = None
+        mask = None
         important_mask = None
         blue_mask = None
         samples: list[tuple[int, int, int, int, int]] = []
         important_samples: list[tuple[int, int, int, int, int]] = []
         if cv2 is not None and np is not None:
             gray = np.asarray(image.convert("L"))
-            important_mask = self._important_pixel_mask(image)
-            blue_mask = self._blue_pixel_mask(image)
+            mask_array = (np.asarray(mask_image) > 32).astype(np.uint8)
+            if int(mask_array.sum()) >= 8 and int(mask_array.sum()) < mask_array.size:
+                mask = mask_array * 255
+            foreground_mask = mask_array.astype(bool) if int(mask_array.sum()) >= 8 else None
+            important_mask = self._important_pixel_mask(image, foreground_mask)
+            blue_mask = self._blue_pixel_mask(image, foreground_mask)
+            color_profile = self._color_profile(np.asarray(image).astype(np.int16), foreground_mask)
         else:
+            color_profile = None
             samples = self._sample_points(image)
             important_samples = self._important_samples(samples)
         return PreparedTemplate(
             image=image,
             samples=samples,
             gray=gray,
+            mask=mask,
             important_mask=important_mask,
             blue_mask=blue_mask,
+            color_profile=color_profile,
             important_samples=important_samples,
             scale=scale,
         )
 
-    def _important_pixel_mask(self, image):
+    def _important_pixel_mask(self, image, foreground_mask=None):
         pixels = np.asarray(image)
-        return (pixels[:, :, 0] < 245) | (pixels[:, :, 1] < 245) | (pixels[:, :, 2] < 245)
+        important_mask = (pixels[:, :, 0] < 245) | (pixels[:, :, 1] < 245) | (pixels[:, :, 2] < 245)
+        if foreground_mask is not None:
+            important_mask = important_mask & foreground_mask
+        return important_mask
 
-    def _blue_pixel_mask(self, image):
-        return self._blue_pixels(np.asarray(image))
+    def _blue_pixel_mask(self, image, foreground_mask=None):
+        blue_mask = self._blue_pixels(np.asarray(image))
+        if foreground_mask is not None:
+            blue_mask = blue_mask & foreground_mask
+        return blue_mask
 
     def _blue_pixels(self, pixels):
         red = pixels[:, :, 0].astype(np.int16)
         green = pixels[:, :, 1].astype(np.int16)
         blue = pixels[:, :, 2].astype(np.int16)
         return (blue > 140) & (green > 70) & (green < 210) & (red < 140) & ((blue - red) > 45)
+
+    def _color_profile(self, pixels, mask=None) -> TemplateColorProfile:
+        if mask is not None:
+            pixels = pixels[mask]
+            if pixels.size == 0:
+                return TemplateColorProfile(0.0, 0.0, 0.0, 0.0, 0.0)
+            red = pixels[:, 0].astype(np.int16)
+            green = pixels[:, 1].astype(np.int16)
+            blue = pixels[:, 2].astype(np.int16)
+            area = pixels.shape[0]
+        else:
+            red = pixels[:, :, 0].astype(np.int16)
+            green = pixels[:, :, 1].astype(np.int16)
+            blue = pixels[:, :, 2].astype(np.int16)
+            area = pixels.shape[0] * pixels.shape[1]
+        if area <= 0:
+            return TemplateColorProfile(0.0, 0.0, 0.0, 0.0, 0.0)
+
+        if mask is not None:
+            blue_pixels = (blue > 140) & (green > 70) & (green < 210) & (red < 140) & ((blue - red) > 45)
+        else:
+            blue_pixels = self._blue_pixels(pixels)
+        saturated = (np.maximum.reduce((red, green, blue)) - np.minimum.reduce((red, green, blue))) > 70
+        bright = (red > 210) & (green > 210) & (blue > 210)
+        dark = (red < 80) & (green < 80) & (blue < 80)
+        return TemplateColorProfile(
+            bright_ratio=float(bright.mean()),
+            blue_ratio=float(blue_pixels.mean()),
+            saturated_ratio=float(saturated.mean()),
+            saturated_not_blue_ratio=float((saturated & ~blue_pixels).mean()),
+            dark_ratio=float(dark.mean()),
+        )
 
     def _important_samples(
         self,
@@ -1871,10 +1987,137 @@ class ImageTemplateMatcher:
         return [sample for sample in samples if sample[2] < 245 or sample[3] < 245 or sample[4] < 245]
 
     def _contains_with_cv(self, screenshot, templates: list[PreparedTemplate]) -> bool:
-        return self._match_with_cv(screenshot, templates).matched
+        return self._match_prepared_with_cv(screenshot, templates).matched
 
-    def _match_with_cv(self, screenshot, templates: list[PreparedTemplate]) -> ImageMatchResult:
-        screenshot_gray = np.asarray(screenshot.convert("L"))
+    def _match_with_cv(
+        self,
+        screenshot,
+        downsample: float,
+        scales: tuple[float, ...],
+        *,
+        preferred_scale: float | None = None,
+    ) -> ImageMatchResult:
+        search_scales = self._cv_search_scales(scales, preferred_scale)
+        templates = self._prepare_templates(search_scales, downsample)
+        screenshot_gray = self._screenshot_gray_array(screenshot)
+
+        priority_templates = self._priority_search_templates(templates)
+        priority_template_ids = {id(template) for template in priority_templates}
+        remaining_templates = [template for template in templates if id(template) not in priority_template_ids]
+
+        result = self._match_prepared_with_cv(screenshot, priority_templates, screenshot_gray)
+        if result.matched:
+            return result
+
+        result = self._match_standard_with_cv(screenshot, remaining_templates, screenshot_gray)
+        if result.matched:
+            return result
+
+        result = self._match_masked_with_cv(
+            screenshot,
+            [
+                template
+                for template in self._masked_search_templates(templates)
+                if id(template) not in priority_template_ids
+            ],
+            screenshot_gray,
+        )
+        if result.matched:
+            return result
+
+        for prepared in self._relaxed_search_templates(templates):
+            result = self._match_relaxed_masked_with_cv(screenshot, prepared, screenshot_gray)
+            if result.matched:
+                return result
+        return ImageMatchResult(matched=False, has_features=True)
+
+    def _cv_search_scales(
+        self,
+        scales: tuple[float, ...],
+        preferred_scale: float | None = None,
+    ) -> tuple[float, ...]:
+        if not scales:
+            return scales
+
+        selected = set(self._coarse_match_scales(scales))
+        scale_hint = self._scale_hint(preferred_scale)
+        if scale_hint > 0:
+            min_scale = scale_hint * (1.0 - RECAPTCHA_FINE_MATCH_SCALE_WINDOW_RATIO)
+            max_scale = scale_hint * (1.0 + RECAPTCHA_FINE_MATCH_SCALE_WINDOW_RATIO)
+            selected.update(scale for scale in scales if min_scale <= scale <= max_scale)
+
+        return tuple(scale for scale in scales if scale in selected)
+
+    def _coarse_match_scales(self, scales: tuple[float, ...]) -> tuple[float, ...]:
+        if len(scales) <= 2:
+            return scales
+
+        selected: set[float] = set()
+        last_selected: float | None = None
+        ascending_scales = sorted(scales)
+        for scale in ascending_scales:
+            if last_selected is None or scale / last_selected >= RECAPTCHA_COARSE_MATCH_SCALE_STEP_RATIO:
+                selected.add(scale)
+                last_selected = scale
+        selected.add(ascending_scales[-1])
+        return tuple(scale for scale in scales if scale in selected)
+
+    def _screenshot_gray_array(self, screenshot):
+        return np.asarray(screenshot.convert("L"))
+
+    def _priority_search_templates(self, templates: list[PreparedTemplate]) -> list[PreparedTemplate]:
+        return templates[:RECAPTCHA_MASKED_PRIORITY_SCALE_LIMIT]
+
+    def _masked_search_templates(self, templates: list[PreparedTemplate]) -> list[PreparedTemplate]:
+        selected: list[PreparedTemplate] = []
+        selected_ids: set[int] = set()
+
+        def add(template: PreparedTemplate) -> None:
+            if template.mask is None or id(template) in selected_ids:
+                return
+            selected.append(template)
+            selected_ids.add(id(template))
+
+        for template in templates:
+            if len(selected) >= RECAPTCHA_MASKED_PRIORITY_SCALE_LIMIT:
+                break
+            add(template)
+
+        for template in templates:
+            if template.scale <= RECAPTCHA_MASKED_SMALL_SCALE_MAX:
+                add(template)
+
+        return selected
+
+    def _relaxed_search_templates(self, templates: list[PreparedTemplate]) -> list[PreparedTemplate]:
+        selected: list[PreparedTemplate] = []
+        for template in templates:
+            if template.mask is None or template.gray is None or template.scale < RECAPTCHA_RELAXED_MASKED_SCALE_MIN:
+                continue
+            selected.append(template)
+            if len(selected) >= RECAPTCHA_RELAXED_MASKED_SCALE_LIMIT:
+                break
+        return selected
+
+    def _match_prepared_with_cv(
+        self,
+        screenshot,
+        templates: list[PreparedTemplate],
+        screenshot_gray=None,
+    ) -> ImageMatchResult:
+        if screenshot_gray is None:
+            screenshot_gray = self._screenshot_gray_array(screenshot)
+        result = self._match_standard_with_cv(screenshot, templates, screenshot_gray)
+        if result.matched:
+            return result
+        return self._match_masked_with_cv(screenshot, templates, screenshot_gray)
+
+    def _match_standard_with_cv(
+        self,
+        screenshot,
+        templates: list[PreparedTemplate],
+        screenshot_gray,
+    ) -> ImageMatchResult:
         for prepared in templates:
             template_gray = prepared.gray
             if template_gray is None:
@@ -1890,14 +2133,86 @@ class ImageTemplateMatcher:
                 return ImageMatchResult(matched=True, has_features=True, match_scale=prepared.scale)
         return ImageMatchResult(matched=False, has_features=True)
 
+    def _match_masked_with_cv(
+        self,
+        screenshot,
+        templates: list[PreparedTemplate],
+        screenshot_gray,
+    ) -> ImageMatchResult:
+        for prepared in templates:
+            template_gray = prepared.gray
+            if template_gray is None or prepared.mask is None:
+                continue
+            if screenshot_gray.shape[0] < template_gray.shape[0] or screenshot_gray.shape[1] < template_gray.shape[1]:
+                continue
+            try:
+                masked_result = cv2.matchTemplate(
+                    screenshot_gray,
+                    template_gray,
+                    cv2.TM_CCOEFF_NORMED,
+                    mask=prepared.mask,
+                )
+            except cv2.error:
+                continue
+            if masked_result.size == 0:
+                continue
+            masked_result = np.nan_to_num(masked_result, nan=-1.0, posinf=-1.0, neginf=-1.0)
+            _, masked_max_value, _, masked_max_location = cv2.minMaxLoc(masked_result)
+            if (
+                masked_max_value >= self._masked_cv_threshold_for(prepared)
+                and self._verify_candidate(screenshot, prepared, masked_max_location)
+            ):
+                return ImageMatchResult(matched=True, has_features=True, match_scale=prepared.scale)
+        return ImageMatchResult(matched=False, has_features=True)
+
+    def _match_relaxed_masked_with_cv(
+        self,
+        screenshot,
+        prepared: PreparedTemplate,
+        screenshot_gray=None,
+    ) -> ImageMatchResult:
+        if prepared.mask is None or prepared.gray is None or prepared.scale < RECAPTCHA_RELAXED_MASKED_SCALE_MIN:
+            return ImageMatchResult(matched=False, has_features=True)
+
+        if screenshot_gray is None:
+            screenshot_gray = self._screenshot_gray_array(screenshot)
+        if screenshot_gray.shape[0] < prepared.gray.shape[0] or screenshot_gray.shape[1] < prepared.gray.shape[1]:
+            return ImageMatchResult(matched=False, has_features=True)
+
+        try:
+            result = cv2.matchTemplate(
+                screenshot_gray,
+                prepared.gray,
+                cv2.TM_CCORR_NORMED,
+                mask=prepared.mask,
+            )
+        except cv2.error:
+            return ImageMatchResult(matched=False, has_features=True)
+        if result.size == 0:
+            return ImageMatchResult(matched=False, has_features=True)
+
+        result = np.nan_to_num(result, nan=-1.0, posinf=-1.0, neginf=-1.0)
+        _, max_value, _, max_location = cv2.minMaxLoc(result)
+        if (
+            max_value >= RECAPTCHA_RELAXED_MASKED_CCORR_THRESHOLD
+            and self._verify_relaxed_masked_candidate(screenshot, prepared, max_location)
+        ):
+            return ImageMatchResult(matched=True, has_features=True, match_scale=prepared.scale)
+        return ImageMatchResult(matched=False, has_features=True)
+
     def _cv_threshold_for(self, template: PreparedTemplate) -> float:
-        if self._profile == "full":
-            return RECAPTCHA_FULL_CV_MATCH_THRESHOLD
         if template.scale <= 0.35:
             return RECAPTCHA_TINY_CV_MATCH_THRESHOLD
         if template.scale <= 0.55:
             return RECAPTCHA_SMALL_CV_MATCH_THRESHOLD
         return self._cv_threshold
+
+    def _masked_cv_threshold_for(self, template: PreparedTemplate) -> float:
+        if template.scale <= 0.35:
+            return RECAPTCHA_TINY_MASKED_CV_MATCH_THRESHOLD
+        if template.scale <= 0.55:
+            return RECAPTCHA_SMALL_MASKED_CV_MATCH_THRESHOLD
+        return RECAPTCHA_MASKED_CV_MATCH_THRESHOLD
 
     def _verify_candidate(self, screenshot, template: PreparedTemplate, location: tuple[int, int]) -> bool:
         x, y = location
@@ -1910,15 +2225,17 @@ class ImageTemplateMatcher:
         crop = screenshot.crop((x, y, x + template_image.width, y + template_image.height))
         if np is not None:
             crop_array = np.asarray(crop).astype(np.int16)
-            if not self._verify_candidate_palette(crop_array):
+            if not self._verify_candidate_palette(crop_array, template):
                 return False
 
             template_array = np.asarray(template_image).astype(np.int16)
             diff = np.abs(crop_array - template_array)
             per_pixel = diff.mean(axis=2)
-            mean = float(per_pixel.mean())
+            foreground_mask = self._candidate_foreground_mask(template)
+            errors = per_pixel[foreground_mask] if foreground_mask is not None else per_pixel
+            mean = float(errors.mean())
             mean_threshold, good_pixel_threshold, good_pixel_ratio = self._verify_thresholds(template)
-            good_ratio = float((per_pixel <= good_pixel_threshold).mean())
+            good_ratio = float((errors <= good_pixel_threshold).mean())
             if mean > mean_threshold or good_ratio < good_pixel_ratio:
                 return False
             return self._verify_important_pixels(per_pixel, template) and self._verify_blue_pixels(crop_array, template)
@@ -1927,6 +2244,50 @@ class ImageTemplateMatcher:
         mean = sum(ImageStat.Stat(diff).mean) / 3
         mean_threshold, _, _ = self._verify_thresholds(template)
         return mean <= max(self._threshold, mean_threshold)
+
+    def _verify_relaxed_masked_candidate(
+        self,
+        screenshot,
+        template: PreparedTemplate,
+        location: tuple[int, int],
+    ) -> bool:
+        if np is None or template.mask is None:
+            return False
+
+        x, y = location
+        template_image = template.image
+        if x < 0 or y < 0:
+            return False
+        if x + template_image.width > screenshot.width or y + template_image.height > screenshot.height:
+            return False
+
+        foreground_mask = self._candidate_foreground_mask(template)
+        if foreground_mask is None:
+            return False
+
+        crop = screenshot.crop((x, y, x + template_image.width, y + template_image.height))
+        crop_array = np.asarray(crop).astype(np.int16)
+        template_array = np.asarray(template_image).astype(np.int16)
+        per_pixel = np.abs(crop_array - template_array).mean(axis=2)
+        foreground_errors = per_pixel[foreground_mask]
+        if foreground_errors.size == 0:
+            return False
+
+        mean_threshold, good_pixel_threshold, _ = self._verify_thresholds(template)
+        mean = float(foreground_errors.mean())
+        good_ratio = float((foreground_errors <= good_pixel_threshold).mean())
+        if mean > max(60.0, mean_threshold * 3.0) or good_ratio < 0.60:
+            return False
+
+        crop_profile = self._color_profile(crop_array, foreground_mask)
+        template_profile = template.color_profile
+        if template_profile is None:
+            return True
+        return (
+            abs(crop_profile.bright_ratio - template_profile.bright_ratio) <= 0.12
+            and abs(crop_profile.saturated_ratio - template_profile.saturated_ratio) <= 0.20
+            and abs(crop_profile.dark_ratio - template_profile.dark_ratio) <= 0.12
+        )
 
     def _verify_thresholds(self, template: PreparedTemplate) -> tuple[float, float, float]:
         if template.scale <= 0.35:
@@ -1939,33 +2300,28 @@ class ImageTemplateMatcher:
             RECAPTCHA_VERIFY_GOOD_PIXEL_RATIO,
         )
 
-    def _verify_candidate_palette(self, crop_array) -> bool:
+    def _verify_candidate_palette(self, crop_array, template: PreparedTemplate) -> bool:
         if crop_array.size == 0:
             return False
 
-        red = crop_array[:, :, 0].astype(np.int16)
-        green = crop_array[:, :, 1].astype(np.int16)
-        blue = crop_array[:, :, 2].astype(np.int16)
-        area = crop_array.shape[0] * crop_array.shape[1]
-        bright = (red > 210) & (green > 210) & (blue > 210)
-        blue_pixels = self._blue_pixels(crop_array)
-        saturated = (np.maximum.reduce((red, green, blue)) - np.minimum.reduce((red, green, blue))) > 70
-        saturated_not_blue = saturated & ~blue_pixels
-        dark = (red < 80) & (green < 80) & (blue < 80)
+        crop_profile = self._color_profile(crop_array, self._candidate_foreground_mask(template))
+        template_profile = template.color_profile
+        if template_profile is None:
+            return True
 
-        if self._profile == "full":
-            return (
-                int(bright.sum()) / area >= 0.70
-                and int(blue_pixels.sum()) / area >= 0.025
-                and int(saturated_not_blue.sum()) / area <= 0.11
-                and int(dark.sum()) / area <= 0.05
-            )
+        def close_enough(actual: float, expected: float, *, minimum: float = 0.03, ratio: float = 0.65) -> bool:
+            tolerance = max(minimum, expected * ratio)
+            return expected - tolerance <= actual <= expected + tolerance
 
         return (
-            int(bright.sum()) / area >= 0.66
-            and int(blue_pixels.sum()) / area >= 0.12
-            and int(saturated_not_blue.sum()) / area <= 0.05
-            and int(dark.sum()) / area <= 0.06
+            close_enough(crop_profile.bright_ratio, template_profile.bright_ratio, minimum=0.04)
+            and close_enough(crop_profile.saturated_ratio, template_profile.saturated_ratio, minimum=0.08)
+            and close_enough(
+                crop_profile.saturated_not_blue_ratio,
+                template_profile.saturated_not_blue_ratio,
+                minimum=0.08,
+            )
+            and close_enough(crop_profile.dark_ratio, template_profile.dark_ratio, minimum=0.08)
         )
 
     def _verify_important_pixels(self, per_pixel, template: PreparedTemplate) -> bool:
@@ -1994,13 +2350,17 @@ class ImageTemplateMatcher:
         blue_count = int(blue_mask.sum())
         if blue_count < 8:
             return True
+        if template.color_profile is not None and template.color_profile.blue_ratio < 0.02:
+            return True
 
         crop_blue_pixels = self._blue_pixels(crop_array)
-        if self._profile == "full":
-            return float(crop_blue_pixels[blue_mask].mean()) >= 0.80
-
         required_ratio = 0.78 if template.scale <= 0.35 else 0.84 if template.scale <= 0.55 else 0.88
         return float(crop_blue_pixels[blue_mask].mean()) >= required_ratio
+
+    def _candidate_foreground_mask(self, template: PreparedTemplate):
+        if template.mask is None:
+            return None
+        return template.mask > 0
 
     def _verify_important_samples(
         self,
@@ -2107,39 +2467,17 @@ class LieDetectionMatcher:
     def __init__(
         self,
         compact_template_path: Path = RECAPTCHA_TEMPLATE_PATH,
-        full_template_path: Path = RECAPTCHA_FULL_TEMPLATE_PATH,
     ) -> None:
-        self._compact_matcher = ImageTemplateMatcher(compact_template_path, profile="compact")
-        self._full_matcher = (
-            ImageTemplateMatcher(full_template_path, profile="full") if full_template_path.exists() else None
-        )
+        self._compact_matcher = ImageTemplateMatcher(compact_template_path)
 
     def contains(self, screenshot) -> bool:
         return self.analyze(screenshot).matched
 
     def warm_up(self) -> None:
         self._compact_matcher.warm_up()
-        if self._full_matcher is not None:
-            scale_min = RECAPTCHA_PREFERRED_MATCH_SCALE * (1.0 - RECAPTCHA_FULL_MATCH_SCALE_WINDOW_RATIO)
-            scale_max = RECAPTCHA_PREFERRED_MATCH_SCALE * (1.0 + RECAPTCHA_FULL_MATCH_SCALE_WINDOW_RATIO)
-            full_scales = tuple(scale for scale in RECAPTCHA_MATCH_SCALES if scale_min <= scale <= scale_max)
-            self._full_matcher.warm_up(scales=full_scales or (RECAPTCHA_PREFERRED_MATCH_SCALE,))
 
     def analyze(self, screenshot) -> ImageMatchResult:
-        compact_result = self._compact_matcher.analyze(screenshot)
-        if not compact_result.matched or self._full_matcher is None:
-            return compact_result
-
-        full_result = self._full_matcher.analyze(
-            screenshot,
-            preferred_scale=compact_result.match_scale,
-            scale_window_ratio=RECAPTCHA_FULL_MATCH_SCALE_WINDOW_RATIO,
-        )
-        return ImageMatchResult(
-            matched=full_result.matched,
-            has_features=compact_result.has_features or full_result.has_features,
-            match_scale=full_result.match_scale,
-        )
+        return self._compact_matcher.analyze(screenshot)
 
 
 class RecaptchaMonitor:
@@ -2180,7 +2518,7 @@ class RecaptchaMonitor:
     def _run(self) -> None:
         try:
             capture = FocusedWindowCapture(excluded_pid=self._excluded_pid)
-            matcher = LieDetectionMatcher(RECAPTCHA_TEMPLATE_PATH, RECAPTCHA_FULL_TEMPLATE_PATH)
+            matcher = LieDetectionMatcher(RECAPTCHA_TEMPLATE_PATH)
             matcher.warm_up()
         except Exception as exc:
             self._publish("error", f"測謊偵測無法啟動：{exc}")
@@ -2200,8 +2538,10 @@ class RecaptchaMonitor:
                         has_features=False,
                     )
                     matched = result.matched
-                    if result.has_features:
+                    if matched:
                         scan_interval = RECAPTCHA_FEATURE_SCAN_INTERVAL_SECONDS
+                    elif result.has_features:
+                        scan_interval = RECAPTCHA_UNMATCHED_FEATURE_SCAN_INTERVAL_SECONDS
                     if matched and self._is_confirmed_match():
                         self._queue_detected_notification(recipient.webhook_url, recipient.user_id, screenshot)
                     elif not matched:
@@ -2662,8 +3002,9 @@ class RunningScriptsOverlay:
     _pad_y = 8
     _text_width = 340
 
-    def __init__(self, root: tk.Tk, on_moved=None) -> None:
+    def __init__(self, root: tk.Tk, on_moved=None, opacity: float = RUNNING_OVERLAY_ALPHA) -> None:
         self._on_moved = on_moved
+        self._opacity = clamp_running_overlay_opacity(opacity)
         self._window = tk.Toplevel(root)
         self._window.withdraw()
         self._window.overrideredirect(True)
@@ -2738,6 +3079,14 @@ class RunningScriptsOverlay:
             self._window.destroy()
         except tk.TclError:
             pass
+
+    def set_opacity(self, opacity: float) -> None:
+        opacity = clamp_running_overlay_opacity(opacity)
+        if abs(opacity - self._opacity) < 0.001:
+            return
+
+        self._opacity = opacity
+        self._configure_window_style()
 
     def is_interacting_or_foreground(self) -> bool:
         return self._dragging or self.is_foreground()
@@ -2916,7 +3265,7 @@ class RunningScriptsOverlay:
                 ctypes.c_ulong,
             )
             user32.SetLayeredWindowAttributes.restype = ctypes.c_bool
-            alpha = max(0, min(255, int(round(RUNNING_OVERLAY_ALPHA * 255))))
+            alpha = max(0, min(255, int(round(self._opacity * 255))))
             user32.SetLayeredWindowAttributes(
                 hwnd,
                 self._color_ref(self._transparent_color),
@@ -2925,7 +3274,7 @@ class RunningScriptsOverlay:
             )
         except Exception:
             try:
-                self._window.attributes("-alpha", RUNNING_OVERLAY_ALPHA)
+                self._window.attributes("-alpha", self._opacity)
                 self._window.attributes("-transparentcolor", self._transparent_color)
             except tk.TclError:
                 pass
@@ -2967,6 +3316,7 @@ class AutoKeyboardApp:
         self._auto_save_step_after_id: str | None = None
         self._hotkey_register_after_id: str | None = None
         self._recaptcha_save_after_id: str | None = None
+        self._running_overlay_save_after_id: str | None = None
         self._poll_after_id: str | None = None
         self._window_event_after_id: str | None = None
         self._running_overlay_offset = (RUNNING_OVERLAY_OFFSET_X, RUNNING_OVERLAY_OFFSET_Y)
@@ -2998,6 +3348,10 @@ class AutoKeyboardApp:
         self.step_delay_ms_var = tk.StringVar(value="1,000")
         self.step_script_var = tk.StringVar()
         self.running_overlay_enabled_var = tk.BooleanVar(value=self.running_overlay_settings.enabled)
+        self.running_overlay_opacity_var = tk.DoubleVar(value=self.running_overlay_settings.opacity * 100)
+        self.running_overlay_opacity_label_var = tk.StringVar(
+            value=format_running_overlay_opacity_label(self.running_overlay_settings.opacity)
+        )
         self.recaptcha_enabled_var = tk.BooleanVar(value=self.recaptcha_settings.enabled)
         self.recaptcha_maplestory_only_var = tk.BooleanVar(value=self.recaptcha_settings.only_maplestory_window)
         self.recaptcha_recipient_name_var = tk.StringVar(value=self.recaptcha_settings.recipient_name)
@@ -3009,7 +3363,11 @@ class AutoKeyboardApp:
 
         self._configure_style()
         self._build_ui()
-        self.running_overlay = RunningScriptsOverlay(self.root, on_moved=self._on_running_overlay_moved)
+        self.running_overlay = RunningScriptsOverlay(
+            self.root,
+            on_moved=self._on_running_overlay_moved,
+            opacity=self.running_overlay_settings.opacity,
+        )
         self._bind_auto_save()
         self._refresh_recaptcha_binding_display()
         self.recaptcha_monitor.set_settings(self.recaptcha_settings)
@@ -3259,12 +3617,31 @@ class AutoKeyboardApp:
 
         overlay_frame = ttk.Frame(left, style="Panel.TFrame")
         overlay_frame.grid(row=3, column=0, sticky="ew", pady=(12, 0))
+        overlay_frame.columnconfigure(1, weight=1)
         ttk.Checkbutton(
             overlay_frame,
             text="顯示腳本懸浮提示",
             variable=self.running_overlay_enabled_var,
             command=self._on_running_overlay_toggled,
-        ).grid(row=0, column=0, sticky="w")
+        ).grid(row=0, column=0, columnspan=3, sticky="w")
+        ttk.Label(overlay_frame, text="透明度", style="Panel.TLabel").grid(
+            row=1, column=0, sticky="w", pady=(8, 0)
+        )
+        ttk.Scale(
+            overlay_frame,
+            from_=RUNNING_OVERLAY_MIN_ALPHA * 100,
+            to=RUNNING_OVERLAY_MAX_ALPHA * 100,
+            orient=tk.HORIZONTAL,
+            variable=self.running_overlay_opacity_var,
+            command=self._on_running_overlay_opacity_changed,
+        ).grid(row=1, column=1, sticky="ew", padx=(8, 8), pady=(8, 0))
+        ttk.Label(
+            overlay_frame,
+            textvariable=self.running_overlay_opacity_label_var,
+            style="Panel.TLabel",
+            width=5,
+            anchor="e",
+        ).grid(row=1, column=2, sticky="e", pady=(8, 0))
 
         ttk.Separator(left).grid(row=4, column=0, sticky="ew", pady=(14, 10))
         monitor_frame = ttk.Frame(left, style="Panel.TFrame")
@@ -3872,6 +4249,38 @@ class AutoKeyboardApp:
         self._running_overlay_window_size = (bbox[2] - bbox[0], bbox[3] - bbox[1])
         self._running_overlay_offset = (x - bbox[0], y - bbox[1])
 
+    def _running_overlay_opacity_from_ui(self) -> float:
+        return clamp_running_overlay_opacity(float(self.running_overlay_opacity_var.get()) / 100)
+
+    def _on_running_overlay_opacity_changed(self, _value: str | None = None) -> None:
+        opacity = self._running_overlay_opacity_from_ui()
+        self.running_overlay_opacity_label_var.set(format_running_overlay_opacity_label(opacity))
+        if hasattr(self, "running_overlay"):
+            self.running_overlay.set_opacity(opacity)
+        self._schedule_running_overlay_settings_save()
+
+    def _schedule_running_overlay_settings_save(self) -> None:
+        if self._running_overlay_save_after_id is not None:
+            self.root.after_cancel(self._running_overlay_save_after_id)
+        self._running_overlay_save_after_id = self.root.after(300, self._save_running_overlay_settings_from_ui)
+
+    def _save_running_overlay_settings_from_ui(self, status_message: str | None = None) -> bool:
+        self._running_overlay_save_after_id = None
+        settings = RunningOverlaySettings(
+            enabled=bool(self.running_overlay_enabled_var.get()),
+            opacity=self._running_overlay_opacity_from_ui(),
+        )
+        self.running_overlay_settings = settings
+        try:
+            save_running_overlay_settings(settings)
+        except OSError as exc:
+            self.status_var.set(f"儲存腳本懸浮提示設定失敗：{exc}")
+            return False
+
+        if status_message is not None:
+            self.status_var.set(status_message)
+        return True
+
     def _poll_window_events(self) -> None:
         if self._closing:
             return
@@ -3895,14 +4304,11 @@ class AutoKeyboardApp:
 
     def _on_running_overlay_toggled(self) -> None:
         enabled = bool(self.running_overlay_enabled_var.get())
-        self.running_overlay_settings = RunningOverlaySettings(enabled=enabled)
-        try:
-            save_running_overlay_settings(self.running_overlay_settings)
-        except Exception as exc:
-            self.status_var.set(f"儲存腳本懸浮提示設定失敗：{exc}")
-        else:
-            state = "開啟" if enabled else "關閉"
-            self.status_var.set(f"已{state}腳本懸浮提示。")
+        if self._running_overlay_save_after_id is not None:
+            self.root.after_cancel(self._running_overlay_save_after_id)
+            self._running_overlay_save_after_id = None
+        state = "開啟" if enabled else "關閉"
+        self._save_running_overlay_settings_from_ui(f"已{state}腳本懸浮提示。")
         self._sync_running_overlay()
 
     def _update_toggle_button(self) -> None:
@@ -5224,12 +5630,14 @@ class AutoKeyboardApp:
 
         self._closing = True
         pending_recaptcha_save = self._recaptcha_save_after_id is not None
+        pending_running_overlay_save = self._running_overlay_save_after_id is not None
         for after_id in (
             self._poll_after_id,
             self._auto_save_after_id,
             self._auto_save_step_after_id,
             self._hotkey_register_after_id,
             self._recaptcha_save_after_id,
+            self._running_overlay_save_after_id,
             self._window_event_after_id,
             self._step_drag_pulse_after_id,
         ):
@@ -5242,6 +5650,8 @@ class AutoKeyboardApp:
 
         if pending_recaptcha_save:
             self._save_recaptcha_settings_from_ui()
+        if pending_running_overlay_save:
+            self._save_running_overlay_settings_from_ui()
 
         for runner in list(self.runners.values()):
             runner.stop()

@@ -13,7 +13,6 @@ if str(ROOT) not in sys.path:
 from autokeyboard import (
     ImageTemplateMatcher,
     LieDetectionMatcher,
-    RECAPTCHA_FULL_TEMPLATE_PATH,
     RECAPTCHA_MATCH_SCALE_STEP_RATIO,
     RECAPTCHA_TEMPLATE_PATH,
     build_recaptcha_match_scales,
@@ -22,6 +21,7 @@ from autokeyboard import (
 
 FALSE_POSITIVE_DIR = ROOT / "tests" / "fixtures" / "lie_detection_false_positives"
 TRUE_POSITIVE_DIR = ROOT / "tests" / "fixtures" / "lie_detection_true_positives"
+LEGACY_TRUE_POSITIVE_DIR = ROOT / "tests" / "fixtures" / "lie_detection_legacy_true_positives"
 IMAGE_EXTENSIONS = {".bmp", ".jpeg", ".jpg", ".png", ".webp"}
 
 
@@ -108,7 +108,7 @@ class LieDetectionMatcherTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.compact_matcher = ImageTemplateMatcher(RECAPTCHA_TEMPLATE_PATH)
-        cls.matcher = LieDetectionMatcher(RECAPTCHA_TEMPLATE_PATH, RECAPTCHA_FULL_TEMPLATE_PATH)
+        cls.matcher = LieDetectionMatcher(RECAPTCHA_TEMPLATE_PATH)
 
     def test_detects_current_lie_detection_template(self) -> None:
         image = Image.open(RECAPTCHA_TEMPLATE_PATH).convert("RGB")
@@ -116,18 +116,6 @@ class LieDetectionMatcherTests(unittest.TestCase):
         result = self.compact_matcher.analyze(image)
 
         self.assertTrue(result.matched)
-
-    def test_detects_full_lie_detection_template_with_dual_matcher(self) -> None:
-        image = Image.open(RECAPTCHA_FULL_TEMPLATE_PATH).convert("RGB")
-
-        result = self.matcher.analyze(image)
-
-        self.assertTrue(result.matched)
-
-    def test_cropped_template_alone_does_not_satisfy_dual_matcher(self) -> None:
-        result = self.matcher.analyze(screenshot_with_scaled_lie_detection(0.8, checked=True))
-
-        self.assertFalse(result.matched)
 
     def test_detects_small_in_game_lie_detection_template(self) -> None:
         result = self.compact_matcher.analyze(screenshot_with_scaled_lie_detection(0.3))
@@ -179,6 +167,15 @@ class LieDetectionMatcherTests(unittest.TestCase):
 
     def test_true_positive_fixture_images_are_detected(self) -> None:
         for image_path in fixture_images(TRUE_POSITIVE_DIR):
+            with self.subTest(image=image_path.name):
+                image = Image.open(image_path).convert("RGB")
+
+                result = self.matcher.analyze(image)
+
+                self.assertTrue(result.matched, f"{image_path} was not detected as lie detection")
+
+    def test_legacy_true_positive_fixture_images_are_detected(self) -> None:
+        for image_path in fixture_images(LEGACY_TRUE_POSITIVE_DIR):
             with self.subTest(image=image_path.name):
                 image = Image.open(image_path).convert("RGB")
 

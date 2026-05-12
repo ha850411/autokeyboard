@@ -246,12 +246,22 @@ class ConfigPersistenceTests(unittest.TestCase):
             with patch.object(ak, "RUNNING_OVERLAY_CONFIG_PATH", settings_path):
                 self.assertEqual(ak.load_running_overlay_settings(), ak.RunningOverlaySettings())
 
-                ak.save_running_overlay_settings(ak.RunningOverlaySettings(enabled=False))
+                ak.save_running_overlay_settings(ak.RunningOverlaySettings(enabled=False, opacity=0.45))
                 loaded = ak.load_running_overlay_settings()
                 saved_data = ak.json.loads(settings_path.read_text(encoding="utf-8"))
 
-        self.assertEqual(loaded, ak.RunningOverlaySettings(enabled=False))
-        self.assertEqual(saved_data, {"enabled": False})
+        self.assertEqual(loaded, ak.RunningOverlaySettings(enabled=False, opacity=0.45))
+        self.assertEqual(saved_data, {"enabled": False, "opacity": 0.45})
+
+    def test_running_overlay_settings_clamps_opacity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            settings_path = Path(directory) / "running_overlay.json"
+            settings_path.write_text('{"enabled": true, "opacity": 12}', encoding="utf-8")
+
+            with patch.object(ak, "RUNNING_OVERLAY_CONFIG_PATH", settings_path):
+                loaded = ak.load_running_overlay_settings()
+
+        self.assertEqual(loaded, ak.RunningOverlaySettings(opacity=ak.RUNNING_OVERLAY_MAX_ALPHA))
 
     def test_running_overlay_settings_invalid_config_returns_default(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

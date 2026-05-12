@@ -7,8 +7,7 @@ a = Analysis(
     binaries=[],
     datas=[
         ('assets/AutoKeyboard.ico', 'assets'),
-        ('assets/check/recaptcha.jpg', 'assets/check'),
-        ('assets/check/full-recaptcha.png', 'assets/check'),
+        ('assets/check/recaptcha.png', 'assets/check'),
     ],
     hiddenimports=[],
     hookspath=[],
