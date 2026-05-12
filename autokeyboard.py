@@ -73,7 +73,7 @@ RECAPTCHA_TEMPLATE_PATH = resource_path("assets/check/recaptcha.jpg")
 RECAPTCHA_FULL_TEMPLATE_PATH = resource_path("assets/check/full-recaptcha.png")
 RECAPTCHA_SCAN_INTERVAL_SECONDS = 0.5
 RECAPTCHA_FEATURE_SCAN_INTERVAL_SECONDS = 0.33
-RECAPTCHA_CONFIRM_SECONDS = 1.0
+RECAPTCHA_CONFIRM_SECONDS = 0.6
 RECAPTCHA_MATCH_DOWNSAMPLE = 0.5
 RECAPTCHA_FULL_RES_MAX_PIXELS = 1_000_000
 RECAPTCHA_MATCH_THRESHOLD = 22.0
@@ -88,6 +88,7 @@ RECAPTCHA_MATCH_SCALE_MIN = 0.12
 RECAPTCHA_MATCH_SCALE_MAX = 2.0
 RECAPTCHA_MATCH_SCALE_STEP_RATIO = 1.035
 RECAPTCHA_PREFERRED_MATCH_SCALE = 1.0
+RECAPTCHA_FULL_MATCH_SCALE_WINDOW_RATIO = 0.15
 RECAPTCHA_NOTIFY_INTERVAL_SECONDS = 2.0
 RECAPTCHA_MAX_NOTIFICATION_WORKERS = 3
 DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
@@ -1684,13 +1685,36 @@ class ImageTemplateMatcher:
         self._profile = profile
         self._resample = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
         self._template = Image.open(template_path).convert("RGB")
-        self._templates_by_downsample: dict[tuple[float, tuple[float, ...]], list[PreparedTemplate]] = {}
+        self._templates_by_downsample_scale: dict[tuple[float, float], PreparedTemplate] = {}
         self._last_match_scale: float | None = None
 
     def contains(self, screenshot) -> bool:
         return self.analyze(screenshot).matched
 
-    def analyze(self, screenshot, *, preferred_scale: float | None = None) -> ImageMatchResult:
+    def warm_up(
+        self,
+        *,
+        downsample_values: tuple[float, ...] = (1.0, RECAPTCHA_MATCH_DOWNSAMPLE),
+        scales: tuple[float, ...] | None = None,
+    ) -> None:
+        warm_scales = scales or self._scales or RECAPTCHA_MATCH_SCALES
+        seen_downsamples: set[float] = set()
+        for downsample in downsample_values:
+            if downsample <= 0:
+                continue
+            normalized_downsample = round(downsample, 3)
+            if normalized_downsample in seen_downsamples:
+                continue
+            seen_downsamples.add(normalized_downsample)
+            self._templates_for_downsample(normalized_downsample, warm_scales)
+
+    def analyze(
+        self,
+        screenshot,
+        *,
+        preferred_scale: float | None = None,
+        scale_window_ratio: float | None = None,
+    ) -> ImageMatchResult:
         if screenshot.width <= 0 or screenshot.height <= 0:
             return ImageMatchResult(matched=False, has_features=False)
 
@@ -1704,6 +1728,7 @@ class ImageTemplateMatcher:
             return ImageMatchResult(matched=False, has_features=False)
 
         scales = self._scales_for_screenshot(screenshot)
+        scales = self._scales_near_preferred(scales, preferred_scale, scale_window_ratio)
         templates = self._templates_for_downsample(downsample, scales)
         templates = self._prioritized_templates(templates, preferred_scale)
 
@@ -1738,6 +1763,24 @@ class ImageTemplateMatcher:
         max_scale = min(RECAPTCHA_MATCH_SCALE_MAX, max_scale_by_width, max_scale_by_height)
         return build_recaptcha_match_scales(max_scale=max_scale)
 
+    def _scales_near_preferred(
+        self,
+        scales: tuple[float, ...],
+        preferred_scale: float | None,
+        scale_window_ratio: float | None,
+    ) -> tuple[float, ...]:
+        if not scales or preferred_scale is None or preferred_scale <= 0:
+            return scales
+        if scale_window_ratio is None or scale_window_ratio <= 0:
+            return scales
+
+        min_scale = preferred_scale * (1.0 - scale_window_ratio)
+        max_scale = preferred_scale * (1.0 + scale_window_ratio)
+        nearby = tuple(scale for scale in scales if min_scale <= scale <= max_scale)
+        if nearby:
+            return nearby
+        return (min(scales, key=lambda scale: abs(scale - preferred_scale)),)
+
     def _has_recaptcha_palette(self, screenshot) -> bool:
         if np is None:
             return True
@@ -1757,12 +1800,17 @@ class ImageTemplateMatcher:
         return int(bright_pixels.sum()) >= min_bright_pixels and int(button_blue_pixels.sum()) >= min_blue_pixels
 
     def _templates_for_downsample(self, downsample: float, scales: tuple[float, ...]) -> list[PreparedTemplate]:
-        key = (round(downsample, 3), scales)
-        templates = self._templates_by_downsample.get(key)
-        if templates is None:
-            templates = self._prepare_templates(scales, downsample)
-            self._templates_by_downsample[key] = templates
-        return templates
+        normalized_downsample = round(downsample, 3)
+        return [self._template_for_downsample_scale(normalized_downsample, scale) for scale in scales]
+
+    def _template_for_downsample_scale(self, downsample: float, scale: float) -> PreparedTemplate:
+        normalized_scale = round(scale, 3)
+        key = (round(downsample, 3), normalized_scale)
+        template = self._templates_by_downsample_scale.get(key)
+        if template is None:
+            template = self._prepare_template(normalized_scale, key[0])
+            self._templates_by_downsample_scale[key] = template
+        return template
 
     def _prioritized_templates(
         self,
@@ -1775,35 +1823,33 @@ class ImageTemplateMatcher:
         return sorted(templates, key=lambda template: (abs(template.scale - scale_hint), template.scale))
 
     def _prepare_templates(self, scales: tuple[float, ...], downsample: float) -> list[PreparedTemplate]:
-        templates: list[PreparedTemplate] = []
-        for scale in scales:
-            width = max(1, int(self._template.width * scale * downsample))
-            height = max(1, int(self._template.height * scale * downsample))
-            image = self._template.resize((width, height), self._resample)
-            gray = None
-            important_mask = None
-            blue_mask = None
-            samples: list[tuple[int, int, int, int, int]] = []
-            important_samples: list[tuple[int, int, int, int, int]] = []
-            if cv2 is not None and np is not None:
-                gray = np.asarray(image.convert("L"))
-                important_mask = self._important_pixel_mask(image)
-                blue_mask = self._blue_pixel_mask(image)
-            else:
-                samples = self._sample_points(image)
-                important_samples = self._important_samples(samples)
-            templates.append(
-                PreparedTemplate(
-                    image=image,
-                    samples=samples,
-                    gray=gray,
-                    important_mask=important_mask,
-                    blue_mask=blue_mask,
-                    important_samples=important_samples,
-                    scale=scale,
-                )
-            )
-        return templates
+        return [self._template_for_downsample_scale(downsample, scale) for scale in scales]
+
+    def _prepare_template(self, scale: float, downsample: float) -> PreparedTemplate:
+        width = max(1, int(self._template.width * scale * downsample))
+        height = max(1, int(self._template.height * scale * downsample))
+        image = self._template.resize((width, height), self._resample)
+        gray = None
+        important_mask = None
+        blue_mask = None
+        samples: list[tuple[int, int, int, int, int]] = []
+        important_samples: list[tuple[int, int, int, int, int]] = []
+        if cv2 is not None and np is not None:
+            gray = np.asarray(image.convert("L"))
+            important_mask = self._important_pixel_mask(image)
+            blue_mask = self._blue_pixel_mask(image)
+        else:
+            samples = self._sample_points(image)
+            important_samples = self._important_samples(samples)
+        return PreparedTemplate(
+            image=image,
+            samples=samples,
+            gray=gray,
+            important_mask=important_mask,
+            blue_mask=blue_mask,
+            important_samples=important_samples,
+            scale=scale,
+        )
 
     def _important_pixel_mask(self, image):
         pixels = np.asarray(image)
@@ -2071,12 +2117,24 @@ class LieDetectionMatcher:
     def contains(self, screenshot) -> bool:
         return self.analyze(screenshot).matched
 
+    def warm_up(self) -> None:
+        self._compact_matcher.warm_up()
+        if self._full_matcher is not None:
+            scale_min = RECAPTCHA_PREFERRED_MATCH_SCALE * (1.0 - RECAPTCHA_FULL_MATCH_SCALE_WINDOW_RATIO)
+            scale_max = RECAPTCHA_PREFERRED_MATCH_SCALE * (1.0 + RECAPTCHA_FULL_MATCH_SCALE_WINDOW_RATIO)
+            full_scales = tuple(scale for scale in RECAPTCHA_MATCH_SCALES if scale_min <= scale <= scale_max)
+            self._full_matcher.warm_up(scales=full_scales or (RECAPTCHA_PREFERRED_MATCH_SCALE,))
+
     def analyze(self, screenshot) -> ImageMatchResult:
         compact_result = self._compact_matcher.analyze(screenshot)
         if not compact_result.matched or self._full_matcher is None:
             return compact_result
 
-        full_result = self._full_matcher.analyze(screenshot, preferred_scale=compact_result.match_scale)
+        full_result = self._full_matcher.analyze(
+            screenshot,
+            preferred_scale=compact_result.match_scale,
+            scale_window_ratio=RECAPTCHA_FULL_MATCH_SCALE_WINDOW_RATIO,
+        )
         return ImageMatchResult(
             matched=full_result.matched,
             has_features=compact_result.has_features or full_result.has_features,
@@ -2123,6 +2181,7 @@ class RecaptchaMonitor:
         try:
             capture = FocusedWindowCapture(excluded_pid=self._excluded_pid)
             matcher = LieDetectionMatcher(RECAPTCHA_TEMPLATE_PATH, RECAPTCHA_FULL_TEMPLATE_PATH)
+            matcher.warm_up()
         except Exception as exc:
             self._publish("error", f"測謊偵測無法啟動：{exc}")
             return
