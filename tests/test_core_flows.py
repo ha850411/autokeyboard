@@ -529,7 +529,7 @@ class RecaptchaMonitorTests(unittest.TestCase):
 
         self.assertEqual(events, [("error", "same error"), ("error", "same error")])
 
-    def test_queue_detected_notification_uses_two_second_cadence(self) -> None:
+    def test_queue_detected_notification_uses_one_second_cadence(self) -> None:
         event_queue: queue.Queue[tuple[str, str]] = queue.Queue()
         monitor = ak.RecaptchaMonitor(event_queue)
         started = []
@@ -544,7 +544,7 @@ class RecaptchaMonitorTests(unittest.TestCase):
                 self.target(*self.args)
 
         with (
-            patch("autokeyboard.time.monotonic", side_effect=[100.0, 101.0, 102.1]),
+            patch("autokeyboard.time.monotonic", side_effect=[100.0, 100.5, 101.0]),
             patch("autokeyboard.threading.Thread", FakeThread),
             patch.object(monitor, "_post_discord_webhook"),
         ):
