@@ -335,6 +335,22 @@ class FakeKeyboard:
         self.calls.append(("up", action))
 
 
+class FakeRunner:
+    def __init__(self) -> None:
+        self.stopped = False
+
+    def stop(self) -> None:
+        self.stopped = True
+
+
+class FakeStringVar:
+    def __init__(self) -> None:
+        self.value = ""
+
+    def set(self, value: str) -> None:
+        self.value = value
+
+
 class ScriptRunnerTests(unittest.TestCase):
     def test_runner_executes_non_repeating_script_and_publishes_events(self) -> None:
         event_queue: queue.Queue[tuple] = queue.Queue()
@@ -442,7 +458,37 @@ class ScriptRunnerTests(unittest.TestCase):
         self.assertGreaterEqual(keyboard.calls.count(("down", action)), 1)
 
 
+class AutoKeyboardAppRuntimeTests(unittest.TestCase):
+    def test_recaptcha_detected_stops_all_running_scripts(self) -> None:
+        app = object.__new__(ak.AutoKeyboardApp)
+        first_runner = FakeRunner()
+        second_runner = FakeRunner()
+        refreshed = []
+        app.runners = {"first": first_runner, "second": second_runner}
+        app.current_step = {"first": "執行中"}
+        app.recaptcha_status_var = FakeStringVar()
+        app.status_var = FakeStringVar()
+        app._refresh_script_tree = lambda: refreshed.append(True)
+
+        ak.AutoKeyboardApp._handle_recaptcha_detected(app, "偵測到測謊。")
+
+        self.assertTrue(first_runner.stopped)
+        self.assertTrue(second_runner.stopped)
+        self.assertEqual(app.current_step, {"first": "停止中", "second": "停止中"})
+        self.assertEqual(refreshed, [True])
+        self.assertEqual(app.status_var.value, "偵測到測謊。 已中止 2 個執行中的腳本。")
+        self.assertEqual(app.recaptcha_status_var.value, app.status_var.value)
+
+
 class RecaptchaMonitorTests(unittest.TestCase):
+    def test_publish_detected_queues_detected_event(self) -> None:
+        event_queue: queue.Queue[tuple[str, str]] = queue.Queue()
+        monitor = ak.RecaptchaMonitor(event_queue)
+
+        monitor._publish_detected()
+
+        self.assertEqual(event_queue.get_nowait(), ("detected", "偵測到測謊。"))
+
     def test_monitor_settings_snapshot_normalizes_values(self) -> None:
         event_queue: queue.Queue[tuple[str, str]] = queue.Queue()
         monitor = ak.RecaptchaMonitor(event_queue)

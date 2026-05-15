@@ -2543,6 +2543,7 @@ class RecaptchaMonitor:
                     elif result.has_features:
                         scan_interval = RECAPTCHA_UNMATCHED_FEATURE_SCAN_INTERVAL_SECONDS
                     if matched and self._is_confirmed_match():
+                        self._publish_detected()
                         self._queue_detected_notification(recipient.webhook_url, recipient.user_id, screenshot)
                     elif not matched:
                         self._reset_match_confirmation()
@@ -2577,6 +2578,9 @@ class RecaptchaMonitor:
 
     def _notify_detected(self, webhook_url: str, user_id: str, screenshot) -> None:
         self._queue_detected_notification(webhook_url, user_id, screenshot)
+
+    def _publish_detected(self) -> None:
+        self._publish("detected", "偵測到測謊。")
 
     def _queue_detected_notification(self, webhook_url: str, user_id: str, screenshot) -> None:
         now = time.monotonic()
@@ -5575,6 +5579,25 @@ class AutoKeyboardApp:
             if script:
                 self.status_var.set(f"正在停止「{script.name}」。")
 
+    def _stop_all_running_scripts(self) -> int:
+        stopped_count = 0
+        for script_id, runner in list(self.runners.items()):
+            runner.stop()
+            self.current_step[script_id] = "停止中"
+            stopped_count += 1
+
+        if stopped_count:
+            self._refresh_script_tree()
+        return stopped_count
+
+    def _handle_recaptcha_detected(self, detail: str) -> None:
+        stopped_count = self._stop_all_running_scripts()
+        message = detail
+        if stopped_count:
+            message = f"{detail} 已中止 {stopped_count} 個執行中的腳本。"
+        self.recaptcha_status_var.set(message)
+        self.status_var.set(message)
+
     def _poll_events(self) -> None:
         if self._closing:
             return
@@ -5615,6 +5638,8 @@ class AutoKeyboardApp:
 
             if event_type == "ready":
                 self._update_recaptcha_status_from_settings(saved=False)
+            elif event_type == "detected":
+                self._handle_recaptcha_detected(detail)
             elif event_type == "notified":
                 self.recaptcha_status_var.set(detail)
                 self.status_var.set(detail)
