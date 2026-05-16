@@ -362,7 +362,12 @@ class UpdateTests(unittest.TestCase):
             ak.launch_update_installer(installer_path)
 
         popen.assert_called_once_with(
-            [str(installer_path), "/FORCECLOSEAPPLICATIONS", "/NORESTARTAPPLICATIONS"],
+            [
+                str(installer_path),
+                "/FORCECLOSEAPPLICATIONS",
+                "/NORESTARTAPPLICATIONS",
+                "/AUTOKEYBOARD_DELETE_SOURCE_INSTALLER=1",
+            ],
             cwd=str(installer_path.parent),
         )
 
@@ -373,10 +378,23 @@ class InstallerScriptTests(unittest.TestCase):
 
         self.assertIn("CloseApplications=force", installer_text)
         self.assertIn("RestartApplications=no", installer_text)
-        self.assertIn("Flags: ignoreversion restartreplace; BeforeInstall: KillRunningAutoKeyboard", installer_text)
+        self.assertIn(
+            'Source: "dist\\AutoKeyboard\\AutoKeyboard.exe"; DestDir: "{app}"; '
+            "Flags: ignoreversion restartreplace; BeforeInstall: KillRunningAutoKeyboard",
+            installer_text,
+        )
+        self.assertIn(
+            'Source: "dist\\AutoKeyboard\\*"; DestDir: "{app}"; '
+            'Flags: ignoreversion recursesubdirs createallsubdirs restartreplace; Excludes: "AutoKeyboard.exe"',
+            installer_text,
+        )
+        self.assertIn('Type: filesandordirs; Name: "{app}\\_internal"', installer_text)
         self.assertIn("/F /T /IM AutoKeyboard.exe", installer_text)
         self.assertIn("function CanReplaceAutoKeyboardExe", installer_text)
         self.assertIn("function PrepareToInstall", installer_text)
+        self.assertIn("function ShouldDeleteSourceInstaller", installer_text)
+        self.assertIn("AUTOKEYBOARD_DELETE_SOURCE_INSTALLER", installer_text)
+        self.assertIn("procedure DeinitializeSetup", installer_text)
 
 
 class TimeFormattingTests(unittest.TestCase):

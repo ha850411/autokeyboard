@@ -93,10 +93,10 @@ python -m unittest discover -s tests
 已安裝 PyInstaller 後可執行：
 
 ```powershell
-python -m PyInstaller --noconsole --onefile --name AutoKeyboard autokeyboard.py
+python -m PyInstaller AutoKeyboard.spec --clean --noconfirm
 ```
 
-輸出檔會在 `dist\AutoKeyboard.exe`。
+輸出檔會在 `dist\AutoKeyboard\AutoKeyboard.exe`。
 
 如果目標程式是用系統管理員權限執行，可另外打包需要系統管理員權限的版本：
 

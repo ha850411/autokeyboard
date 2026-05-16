@@ -8,14 +8,14 @@ ifeq ($(UNAME_S),Linux)
 PS ?= powershell.exe
 PYTHON ?= $(WIN_LOCALAPPDATA_WSL)/Programs/Python/Python311/python.exe
 ISCC ?= $(WIN_LOCALAPPDATA_WSL)/Programs/Inno Setup 6/ISCC.exe
-RM_BUILD = rm -rf build dist/AutoKeyboard.exe installer/AutoKeyboard_Setup.exe
-STOP_APP = $(PS) -NoProfile -ExecutionPolicy Bypass -Command 'Get-Process AutoKeyboard -ErrorAction SilentlyContinue | Where-Object { $$_.Path -like "*\dist\AutoKeyboard.exe" } | Stop-Process -Force -ErrorAction SilentlyContinue; exit 0'
+RM_BUILD = rm -rf build dist/AutoKeyboard dist/AutoKeyboard.exe installer/AutoKeyboard_Setup.exe
+STOP_APP = $(PS) -NoProfile -ExecutionPolicy Bypass -Command 'Get-Process AutoKeyboard -ErrorAction SilentlyContinue | Where-Object { $$_.Path -like "*\dist\AutoKeyboard\AutoKeyboard.exe" -or $$_.Path -like "*\dist\AutoKeyboard.exe" } | Stop-Process -Force -ErrorAction SilentlyContinue; exit 0'
 else
 PS ?= powershell
 PYTHON ?= python
 ISCC ?= $(LOCALAPPDATA)\Programs\Inno Setup 6\ISCC.exe
-RM_BUILD = powershell -NoProfile -ExecutionPolicy Bypass -Command "Remove-Item -Recurse -Force build -ErrorAction SilentlyContinue; Remove-Item -Force dist\AutoKeyboard.exe, installer\AutoKeyboard_Setup.exe -ErrorAction SilentlyContinue"
-STOP_APP = $(PS) -NoProfile -ExecutionPolicy Bypass -Command "Get-Process AutoKeyboard -ErrorAction SilentlyContinue | Where-Object { $$_.Path -like '*\dist\AutoKeyboard.exe' } | Stop-Process -Force -ErrorAction SilentlyContinue; exit 0"
+RM_BUILD = powershell -NoProfile -ExecutionPolicy Bypass -Command "Remove-Item -Recurse -Force build, dist\AutoKeyboard -ErrorAction SilentlyContinue; Remove-Item -Force dist\AutoKeyboard.exe, installer\AutoKeyboard_Setup.exe -ErrorAction SilentlyContinue"
+STOP_APP = $(PS) -NoProfile -ExecutionPolicy Bypass -Command "Get-Process AutoKeyboard -ErrorAction SilentlyContinue | Where-Object { $$_.Path -like '*\dist\AutoKeyboard\AutoKeyboard.exe' -or $$_.Path -like '*\dist\AutoKeyboard.exe' } | Stop-Process -Force -ErrorAction SilentlyContinue; exit 0"
 endif
 
 all: exe installer

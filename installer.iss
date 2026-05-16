@@ -1,7 +1,7 @@
 [Setup]
 AppId={{A9D31B90-EC5D-4A51-8792-55F52C39391C}
 AppName=AutoKeyboard
-AppVersion=1.5.6
+AppVersion=1.5.7
 AppPublisher=AutoKeyboard
 DefaultDirName={localappdata}\Programs\AutoKeyboard
 DefaultGroupName=AutoKeyboard
@@ -22,7 +22,11 @@ RestartApplications=no
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
-Source: "dist\AutoKeyboard.exe"; DestDir: "{app}"; Flags: ignoreversion restartreplace; BeforeInstall: KillRunningAutoKeyboard
+Source: "dist\AutoKeyboard\AutoKeyboard.exe"; DestDir: "{app}"; Flags: ignoreversion restartreplace; BeforeInstall: KillRunningAutoKeyboard
+Source: "dist\AutoKeyboard\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs restartreplace; Excludes: "AutoKeyboard.exe"
+
+[InstallDelete]
+Type: filesandordirs; Name: "{app}\_internal"
 
 [Icons]
 Name: "{group}\AutoKeyboard"; Filename: "{app}\AutoKeyboard.exe"
@@ -77,31 +81,40 @@ begin
   end;
 end;
 
-procedure CleanupPyInstallerTempDirs();
-var
-  FindRec: TFindRec;
-  TempPath: String;
+function ShouldDeleteSourceInstaller(): Boolean;
 begin
-  TempPath := GetTempDir();
-  if FindFirst(TempPath + '_MEI*', FindRec) then
-  begin
-    try
-      repeat
-        if FindRec.Attributes and FILE_ATTRIBUTE_DIRECTORY <> 0 then
-          DelTree(TempPath + FindRec.Name, True, True, True);
-      until not FindNext(FindRec);
-    finally
-      FindClose(FindRec);
-    end;
-  end;
+  Result := ExpandConstant('{param:AUTOKEYBOARD_DELETE_SOURCE_INSTALLER|0}') = '1';
+end;
+
+procedure QueueDeleteSourceInstaller();
+var
+  ResultCode: Integer;
+  SourceExe: String;
+begin
+  if not ShouldDeleteSourceInstaller() then
+    Exit;
+
+  SourceExe := ExpandConstant('{srcexe}');
+  Exec(
+    ExpandConstant('{sys}\cmd.exe'),
+    '/C timeout /T 3 /NOBREAK >nul 2>nul & del /F /Q "' + SourceExe + '"',
+    '',
+    SW_HIDE,
+    ewNoWait,
+    ResultCode
+  );
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   KillRunningAutoKeyboard();
-  CleanupPyInstallerTempDirs();
   if CanReplaceAutoKeyboardExe() then
     Result := ''
   else
     Result := 'AutoKeyboard.exe 仍在執行或被鎖定，請關閉 AutoKeyboard 後再重新安裝。';
+end;
+
+procedure DeinitializeSetup();
+begin
+  QueueDeleteSourceInstaller();
 end;
