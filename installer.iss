@@ -5,6 +5,12 @@
 #define MyAppVersion FileRead(VersionFileHandle)
 #expr FileClose(VersionFileHandle)
 
+; Keep a literal AppVersion in source so v1.5.7 and older updaters that scrape
+; installer.iss can still discover the latest release after AppVersion became a macro.
+#if 0
+AppVersion=1.6.0
+#endif
+
 [Setup]
 AppId={{A9D31B90-EC5D-4A51-8792-55F52C39391C}
 AppName=AutoKeyboard

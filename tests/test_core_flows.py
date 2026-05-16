@@ -393,6 +393,13 @@ class UpdateTests(unittest.TestCase):
         self.assertIn('#expr FileClose(VersionFileHandle)', installer_text)
         self.assertIn("AppVersion={#MyAppVersion}", installer_text)
 
+    def test_installer_script_keeps_literal_version_for_legacy_updaters(self) -> None:
+        version_text = (ROOT / "version.txt").read_text(encoding="utf-8").strip()
+        installer_text = (ROOT / "installer.iss").read_text(encoding="utf-8")
+
+        self.assertIn(f"AppVersion={version_text}", installer_text)
+        self.assertEqual(ak.extract_app_version(installer_text), version_text)
+
     def test_compare_versions_uses_numeric_order(self) -> None:
         self.assertGreater(ak.compare_versions("1.10.0", "1.9.9"), 0)
         self.assertEqual(ak.compare_versions("v1.5.2", "1.5.2.0"), 0)
