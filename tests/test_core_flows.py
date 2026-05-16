@@ -373,7 +373,9 @@ class InstallerScriptTests(unittest.TestCase):
 
         self.assertIn("CloseApplications=force", installer_text)
         self.assertIn("RestartApplications=no", installer_text)
+        self.assertIn("Flags: ignoreversion restartreplace; BeforeInstall: KillRunningAutoKeyboard", installer_text)
         self.assertIn("/F /T /IM AutoKeyboard.exe", installer_text)
+        self.assertIn("function CanReplaceAutoKeyboardExe", installer_text)
         self.assertIn("function PrepareToInstall", installer_text)
 
 

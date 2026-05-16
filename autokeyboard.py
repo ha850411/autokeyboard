@@ -43,7 +43,7 @@ except ImportError:
 
 APP_TITLE = "AutoKeyboard 腳本精靈"
 APP_NAME = "AutoKeyboard"
-APP_VERSION = "1.5.3"
+APP_VERSION = "1.5.4"
 CONFIG_FILENAME = "scripts.json"
 MONITOR_CONFIG_FILENAME = "recaptcha_monitor.json"
 RUNNING_OVERLAY_CONFIG_FILENAME = "running_overlay.json"

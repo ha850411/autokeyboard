@@ -1,7 +1,7 @@
 [Setup]
 AppId={{A9D31B90-EC5D-4A51-8792-55F52C39391C}
 AppName=AutoKeyboard
-AppVersion=1.5.4
+AppVersion=1.5.5
 AppPublisher=AutoKeyboard
 DefaultDirName={localappdata}\Programs\AutoKeyboard
 DefaultGroupName=AutoKeyboard
@@ -22,7 +22,7 @@ RestartApplications=no
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
-Source: "dist\AutoKeyboard.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "dist\AutoKeyboard.exe"; DestDir: "{app}"; Flags: ignoreversion restartreplace; BeforeInstall: KillRunningAutoKeyboard
 
 [Icons]
 Name: "{group}\AutoKeyboard"; Filename: "{app}\AutoKeyboard.exe"
@@ -32,15 +32,56 @@ Name: "{autodesktop}\AutoKeyboard"; Filename: "{app}\AutoKeyboard.exe"; Tasks: d
 Filename: "{app}\AutoKeyboard.exe"; Description: "{cm:LaunchProgram,AutoKeyboard}"; Flags: nowait postinstall skipifsilent
 
 [Code]
+function AutoKeyboardExePath(): String;
+begin
+  Result := ExpandConstant('{app}\AutoKeyboard.exe');
+end;
+
+function CanReplaceAutoKeyboardExe(): Boolean;
+var
+  AppExePath: String;
+  ProbePath: String;
+begin
+  AppExePath := AutoKeyboardExePath();
+  if not FileExists(AppExePath) then
+  begin
+    Result := True;
+    Exit;
+  end;
+
+  ProbePath := AppExePath + '.replacecheck';
+  DeleteFile(ProbePath);
+  Result := RenameFile(AppExePath, ProbePath);
+  if Result then
+  begin
+    if not RenameFile(ProbePath, AppExePath) then
+    begin
+      CopyFile(ProbePath, AppExePath, False);
+      DeleteFile(ProbePath);
+    end;
+  end;
+end;
+
 procedure KillRunningAutoKeyboard();
 var
   ResultCode: Integer;
+  Attempt: Integer;
 begin
-  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /T /IM AutoKeyboard.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  for Attempt := 1 to 10 do
+  begin
+    Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /T /IM AutoKeyboard.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    Sleep(500);
+
+    if CanReplaceAutoKeyboardExe() then
+      Exit;
+  end;
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   KillRunningAutoKeyboard();
-  Result := '';
+  if CanReplaceAutoKeyboardExe() then
+    Result := ''
+  else
+    Result := 'AutoKeyboard.exe 仍在執行或被鎖定，請關閉 AutoKeyboard 後再重新安裝。';
 end;
