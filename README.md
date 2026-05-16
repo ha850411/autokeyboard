@@ -20,6 +20,10 @@
 
 如果是從舊版升級，第一次啟動時會自動把舊版安裝目錄內的 `scripts.json` 複製到新的使用者設定目錄。
 
+## 更新程式
+
+主畫面右上角的「檢查更新」會讀取 `ha850411/autokeyboard` 上的 `installer.iss` 版本，發現新版後下載 `installer/AutoKeyboard_Setup.exe`，並啟動安裝程式。
+
 新版步驟採用羅技巨集那種動作式流程：
 
 1. `X` `按下按鍵`

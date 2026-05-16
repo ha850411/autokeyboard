@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import queue
 import sys
 import tempfile
@@ -281,6 +282,75 @@ class ConfigPersistenceTests(unittest.TestCase):
             ak.normalize_discord_webhook_url(" <https://discord.com/api/webhooks/abc/token> "),
             "https://discord.com/api/webhooks/abc/token",
         )
+
+
+class FakeUrlopenResponse:
+    def __init__(self, data: bytes) -> None:
+        self.stream = io.BytesIO(data)
+
+    def read(self, size: int = -1) -> bytes:
+        return self.stream.read(size)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> bool:
+        return False
+
+
+class UpdateTests(unittest.TestCase):
+    def test_extract_app_version_from_installer_script(self) -> None:
+        self.assertEqual(ak.extract_app_version("[Setup]\nAppName=AutoKeyboard\nAppVersion=1.6.0\n"), "1.6.0")
+
+        with self.assertRaisesRegex(ValueError, "找不到安裝檔版本資訊"):
+            ak.extract_app_version("[Setup]\nAppName=AutoKeyboard\n")
+
+    def test_app_version_matches_installer_script(self) -> None:
+        installer_text = (ROOT / "installer.iss").read_text(encoding="utf-8")
+
+        self.assertEqual(ak.APP_VERSION, ak.extract_app_version(installer_text))
+
+    def test_compare_versions_uses_numeric_order(self) -> None:
+        self.assertGreater(ak.compare_versions("1.10.0", "1.9.9"), 0)
+        self.assertEqual(ak.compare_versions("v1.5.2", "1.5.2.0"), 0)
+        self.assertLess(ak.compare_versions("1.5.2", "1.5.3"), 0)
+
+    def test_fetch_latest_update_info_reads_remote_installer_version(self) -> None:
+        calls = []
+
+        def fake_urlopen(request, timeout):
+            calls.append((request, timeout))
+            return FakeUrlopenResponse(b"[Setup]\nAppVersion=1.6.0\n")
+
+        with patch("autokeyboard.urllib.request.urlopen", side_effect=fake_urlopen):
+            info = ak.fetch_latest_update_info(
+                current_version="1.5.2",
+                version_url="https://example.test/installer.iss",
+                installer_url="https://example.test/AutoKeyboard_Setup.exe",
+            )
+
+        self.assertTrue(info.has_update)
+        self.assertEqual(info.latest_version, "1.6.0")
+        self.assertEqual(info.installer_url, "https://example.test/AutoKeyboard_Setup.exe")
+        self.assertEqual(calls[0][0].full_url, "https://example.test/installer.iss")
+
+    def test_download_update_installer_writes_versioned_exe(self) -> None:
+        def fake_urlopen(_request, timeout):
+            return FakeUrlopenResponse(b"MZ fake installer")
+
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "autokeyboard.urllib.request.urlopen",
+            side_effect=fake_urlopen,
+        ):
+            path = ak.download_update_installer(
+                "https://example.test/AutoKeyboard_Setup.exe",
+                "1.6.0",
+                destination_dir=Path(directory),
+            )
+            downloaded = path.read_bytes()
+
+        self.assertEqual(path.name, "AutoKeyboard_Setup_1.6.0.exe")
+        self.assertEqual(downloaded, b"MZ fake installer")
 
 
 class TimeFormattingTests(unittest.TestCase):

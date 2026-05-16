@@ -9,7 +9,10 @@ import json
 import os
 import platform
 import queue
+import shutil
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -40,9 +43,20 @@ except ImportError:
 
 APP_TITLE = "AutoKeyboard 腳本精靈"
 APP_NAME = "AutoKeyboard"
+APP_VERSION = "1.5.2"
 CONFIG_FILENAME = "scripts.json"
 MONITOR_CONFIG_FILENAME = "recaptcha_monitor.json"
 RUNNING_OVERLAY_CONFIG_FILENAME = "running_overlay.json"
+UPDATE_REPOSITORY = "ha850411/autokeyboard"
+UPDATE_BRANCH = "master"
+UPDATE_VERSION_URL = f"https://raw.githubusercontent.com/{UPDATE_REPOSITORY}/{UPDATE_BRANCH}/installer.iss"
+UPDATE_INSTALLER_URL = (
+    f"https://raw.githubusercontent.com/{UPDATE_REPOSITORY}/{UPDATE_BRANCH}/installer/AutoKeyboard_Setup.exe"
+)
+UPDATE_REQUEST_HEADERS = {
+    "User-Agent": f"{APP_NAME}/{APP_VERSION}",
+    "Cache-Control": "no-cache",
+}
 
 
 def app_directory() -> Path:
@@ -63,6 +77,108 @@ def user_data_directory() -> Path:
         base_directory = Path(os.environ.get("LOCALAPPDATA", str(fallback)))
         return base_directory / APP_NAME
     return Path.home() / f".{APP_NAME.lower()}"
+
+
+@dataclass(frozen=True)
+class UpdateInfo:
+    current_version: str
+    latest_version: str
+    installer_url: str
+
+    @property
+    def has_update(self) -> bool:
+        return compare_versions(self.latest_version, self.current_version) > 0
+
+
+def _numeric_version_parts(version: str) -> tuple[int, ...]:
+    parts: list[int] = []
+    current = ""
+    for char in version.strip().lstrip("vV"):
+        if char.isdigit():
+            current += char
+        elif current:
+            parts.append(int(current))
+            current = ""
+    if current:
+        parts.append(int(current))
+    return tuple(parts or [0])
+
+
+def compare_versions(first: str, second: str) -> int:
+    first_parts = list(_numeric_version_parts(first))
+    second_parts = list(_numeric_version_parts(second))
+    max_length = max(len(first_parts), len(second_parts))
+    first_parts.extend([0] * (max_length - len(first_parts)))
+    second_parts.extend([0] * (max_length - len(second_parts)))
+    if first_parts > second_parts:
+        return 1
+    if first_parts < second_parts:
+        return -1
+    return 0
+
+
+def extract_app_version(installer_iss_text: str) -> str:
+    for line in installer_iss_text.splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key.strip().lower() == "appversion":
+            version = value.strip()
+            if version:
+                return version
+    raise ValueError("找不到安裝檔版本資訊。")
+
+
+def fetch_text(url: str, *, timeout: float = 10.0) -> str:
+    request = urllib.request.Request(url, headers=UPDATE_REQUEST_HEADERS)
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return response.read().decode("utf-8")
+
+
+def fetch_latest_update_info(
+    *,
+    current_version: str = APP_VERSION,
+    version_url: str = UPDATE_VERSION_URL,
+    installer_url: str = UPDATE_INSTALLER_URL,
+) -> UpdateInfo:
+    latest_version = extract_app_version(fetch_text(version_url))
+    return UpdateInfo(
+        current_version=current_version,
+        latest_version=latest_version,
+        installer_url=installer_url,
+    )
+
+
+def _safe_version_filename_part(version: str) -> str:
+    safe = "".join(char if char.isalnum() or char in ".-_" else "_" for char in version.strip())
+    return safe or "latest"
+
+
+def download_update_installer(
+    installer_url: str,
+    latest_version: str,
+    *,
+    destination_dir: Path | None = None,
+    timeout: float = 60.0,
+) -> Path:
+    if destination_dir is None:
+        destination_dir = Path(tempfile.gettempdir()) / APP_NAME / "updates"
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    destination = destination_dir / f"{APP_NAME}_Setup_{_safe_version_filename_part(latest_version)}.exe"
+
+    request = urllib.request.Request(installer_url, headers=UPDATE_REQUEST_HEADERS)
+    with urllib.request.urlopen(request, timeout=timeout) as response, destination.open("wb") as file:
+        shutil.copyfileobj(response, file)
+
+    if destination.stat().st_size <= 0:
+        raise ValueError("下載到的安裝檔是空檔案。")
+    return destination
+
+
+def launch_update_installer(installer_path: Path) -> None:
+    path = Path(installer_path)
+    if platform.system() == "Windows" and hasattr(os, "startfile"):
+        os.startfile(str(path))  # type: ignore[attr-defined]
+        return
+    subprocess.Popen([str(path)], cwd=str(path.parent))
 
 
 LEGACY_CONFIG_PATH = app_directory() / CONFIG_FILENAME
@@ -3306,6 +3422,7 @@ class AutoKeyboardApp:
         self.hotkeys = HotkeyManager()
         self.runtime_events: queue.Queue[tuple] = queue.Queue()
         self.monitor_events: queue.Queue[tuple[str, str]] = queue.Queue()
+        self.update_events: queue.Queue[tuple[str, object]] = queue.Queue()
         self.recaptcha_monitor = RecaptchaMonitor(self.monitor_events, excluded_pid=os.getpid())
         self.maplestory_window_locator = MapleStoryWindowLocator(excluded_pid=os.getpid())
         self.window_event_hook = WindowEventHook()
@@ -3323,6 +3440,7 @@ class AutoKeyboardApp:
         self._running_overlay_save_after_id: str | None = None
         self._poll_after_id: str | None = None
         self._window_event_after_id: str | None = None
+        self._update_thread: threading.Thread | None = None
         self._running_overlay_offset = (RUNNING_OVERLAY_OFFSET_X, RUNNING_OVERLAY_OFFSET_Y)
         self._running_overlay_window_size: tuple[int, int] | None = None
         self._running_overlay_window_bbox: tuple[int, int, int, int] | None = None
@@ -3553,9 +3671,20 @@ class AutoKeyboardApp:
         header.grid(row=0, column=0, sticky="ew")
         header.columnconfigure(1, weight=1)
 
-        ttk.Label(header, text=APP_TITLE, style="AppTitle.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(header, text=f"{APP_TITLE} v{APP_VERSION}", style="AppTitle.TLabel").grid(
+            row=0, column=0, sticky="w"
+        )
+        header_actions = ttk.Frame(header, style="Header.TFrame")
+        header_actions.grid(row=0, column=1, sticky="e")
+        self.update_button = ttk.Button(
+            header_actions,
+            text="檢查更新",
+            style="Ghost.TButton",
+            command=self._check_for_updates,
+        )
+        self.update_button.grid(row=0, column=0, sticky="e", padx=(0, 8))
         self.banner_label = ttk.Label(
-            header,
+            header_actions,
             textvariable=self.banner_var,
             style="Banner.Idle.TLabel",
             anchor="center",
@@ -4305,6 +4434,105 @@ class AutoKeyboardApp:
             WINDOW_EVENT_POLL_INTERVAL_MS,
             self._poll_window_events,
         )
+
+    def _set_update_button_enabled(self, enabled: bool) -> None:
+        if not hasattr(self, "update_button"):
+            return
+        self.update_button.state(["!disabled"] if enabled else ["disabled"])
+
+    def _check_for_updates(self) -> None:
+        if self._update_thread is not None and self._update_thread.is_alive():
+            self.status_var.set("更新作業正在進行中。")
+            return
+
+        self._set_update_button_enabled(False)
+        self.status_var.set("正在檢查更新...")
+        self._update_thread = threading.Thread(target=self._check_for_updates_worker, daemon=True)
+        self._update_thread.start()
+
+    def _check_for_updates_worker(self) -> None:
+        try:
+            info = fetch_latest_update_info()
+        except Exception as exc:
+            self.update_events.put(("update-error", f"檢查更新失敗：{exc}"))
+            return
+
+        event_type = "update-available" if info.has_update else "update-current"
+        self.update_events.put((event_type, info))
+
+    def _download_update(self, info: UpdateInfo) -> None:
+        if self._update_thread is not None and self._update_thread.is_alive():
+            self.status_var.set("更新作業正在進行中。")
+            return
+
+        self._set_update_button_enabled(False)
+        self.status_var.set(f"正在下載 AutoKeyboard v{info.latest_version} 安裝檔...")
+        self._update_thread = threading.Thread(target=self._download_update_worker, args=(info,), daemon=True)
+        self._update_thread.start()
+
+    def _download_update_worker(self, info: UpdateInfo) -> None:
+        try:
+            installer_path = download_update_installer(info.installer_url, info.latest_version)
+        except Exception as exc:
+            self.update_events.put(("update-error", f"下載更新失敗：{exc}"))
+            return
+        self.update_events.put(("update-ready", (info, installer_path)))
+
+    def _poll_update_events(self) -> None:
+        while True:
+            try:
+                event_type, detail = self.update_events.get_nowait()
+            except queue.Empty:
+                break
+
+            self._update_thread = None
+            if event_type == "update-current":
+                info = detail
+                if isinstance(info, UpdateInfo):
+                    message = f"目前已是最新版（v{info.current_version}）。"
+                else:
+                    message = "目前已是最新版。"
+                self.status_var.set(message)
+                self._set_update_button_enabled(True)
+                messagebox.showinfo(APP_TITLE, message)
+            elif event_type == "update-available":
+                info = detail
+                self._set_update_button_enabled(True)
+                if not isinstance(info, UpdateInfo):
+                    self.status_var.set("更新資訊格式錯誤。")
+                    messagebox.showerror(APP_TITLE, "更新資訊格式錯誤。")
+                    continue
+                self.status_var.set(f"發現新版 AutoKeyboard v{info.latest_version}。")
+                if messagebox.askyesno(
+                    APP_TITLE,
+                    (
+                        f"發現新版 AutoKeyboard v{info.latest_version}。\n"
+                        f"目前版本是 v{info.current_version}。\n\n"
+                        "要下載並啟動安裝程式嗎？"
+                    ),
+                ):
+                    self._download_update(info)
+            elif event_type == "update-ready":
+                info, installer_path = detail  # type: ignore[misc]
+                self.status_var.set(f"AutoKeyboard v{info.latest_version} 安裝檔下載完成。")
+                messagebox.showinfo(
+                    APP_TITLE,
+                    "下載完成。\n\n按下確定後會啟動安裝程式，並關閉目前的 AutoKeyboard。",
+                )
+                try:
+                    launch_update_installer(Path(installer_path))
+                except OSError as exc:
+                    self._set_update_button_enabled(True)
+                    self.status_var.set(f"啟動更新安裝程式失敗：{exc}")
+                    messagebox.showerror(APP_TITLE, f"啟動更新安裝程式失敗：\n{exc}")
+                    continue
+                self.status_var.set("已啟動更新安裝程式，正在關閉 AutoKeyboard。")
+                self.root.after(250, self._on_close)
+            elif event_type == "update-error":
+                message = str(detail)
+                self.status_var.set(message)
+                self._set_update_button_enabled(True)
+                messagebox.showerror(APP_TITLE, message)
 
     def _on_running_overlay_toggled(self) -> None:
         enabled = bool(self.running_overlay_enabled_var.get())
@@ -5646,6 +5874,8 @@ class AutoKeyboardApp:
             elif event_type == "error":
                 self.recaptcha_status_var.set(detail)
                 self.status_var.set(detail)
+
+        self._poll_update_events()
 
         self._poll_after_id = self.root.after(80, self._poll_events)
 
