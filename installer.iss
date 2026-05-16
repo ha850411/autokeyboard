@@ -1,7 +1,7 @@
 [Setup]
 AppId={{A9D31B90-EC5D-4A51-8792-55F52C39391C}
 AppName=AutoKeyboard
-AppVersion=1.5.5
+AppVersion=1.5.6
 AppPublisher=AutoKeyboard
 DefaultDirName={localappdata}\Programs\AutoKeyboard
 DefaultGroupName=AutoKeyboard
@@ -77,9 +77,29 @@ begin
   end;
 end;
 
+procedure CleanupPyInstallerTempDirs();
+var
+  FindRec: TFindRec;
+  TempPath: String;
+begin
+  TempPath := GetTempDir();
+  if FindFirst(TempPath + '_MEI*', FindRec) then
+  begin
+    try
+      repeat
+        if FindRec.Attributes and FILE_ATTRIBUTE_DIRECTORY <> 0 then
+          DelTree(TempPath + FindRec.Name, True, True, True);
+      until not FindNext(FindRec);
+    finally
+      FindClose(FindRec);
+    end;
+  end;
+end;
+
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   KillRunningAutoKeyboard();
+  CleanupPyInstallerTempDirs();
   if CanReplaceAutoKeyboardExe() then
     Result := ''
   else
