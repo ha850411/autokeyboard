@@ -20,7 +20,7 @@ import urllib.request
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -45,6 +45,9 @@ APP_TITLE = "AutoKeyboard 腳本精靈"
 APP_NAME = "AutoKeyboard"
 APP_VERSION = "1.5.7"
 CONFIG_FILENAME = "scripts.json"
+SCRIPT_GROUP_CONFIG_FORMAT = "autokeyboard.script_groups"
+SCRIPT_GROUP_CONFIG_VERSION = 2
+DEFAULT_SCRIPT_GROUP_NAME = "設定組 1"
 MONITOR_CONFIG_FILENAME = "recaptcha_monitor.json"
 RUNNING_OVERLAY_CONFIG_FILENAME = "running_overlay.json"
 UPDATE_REPOSITORY = "ha850411/autokeyboard"
@@ -224,6 +227,7 @@ RECAPTCHA_PREFERRED_MATCH_SCALE = 1.0
 RECAPTCHA_WARM_UP_SCALE_LIMIT = 18
 RECAPTCHA_NOTIFY_INTERVAL_SECONDS = 1.0
 RECAPTCHA_MAX_NOTIFICATION_WORKERS = 3
+RUNNER_STOP_WAIT_SECONDS = 0.5
 DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
 PROCESS_PER_MONITOR_DPI_AWARE = 2
 
@@ -985,6 +989,42 @@ class Script:
         return Script.from_dict(self.to_dict())
 
 
+def _scripts_from_raw_config(raw_scripts: object) -> list[Script]:
+    if raw_scripts is None:
+        return []
+    if not isinstance(raw_scripts, list):
+        raise ValueError("scripts 欄位格式不正確。")
+
+    scripts: list[Script] = []
+    for index, item in enumerate(raw_scripts, start=1):
+        if not isinstance(item, dict):
+            raise ValueError(f"第 {index} 個腳本格式不正確。")
+        scripts.append(Script.from_dict(item))
+    return scripts
+
+
+@dataclass
+class ScriptGroup:
+    id: str
+    name: str
+    scripts: list[Script] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, data: dict, fallback_name: str) -> "ScriptGroup":
+        return cls(
+            id=str(data.get("id") or uuid.uuid4()),
+            name=str(data.get("name") or fallback_name),
+            scripts=_scripts_from_raw_config(data.get("scripts", [])),
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "scripts": [script.to_dict() for script in self.scripts],
+        }
+
+
 def scripts_by_id(scripts: Iterable[Script]) -> dict[str, Script]:
     return {script.id: script for script in scripts}
 
@@ -1040,6 +1080,14 @@ def default_scripts() -> list[Script]:
     ]
 
 
+def default_script_group() -> ScriptGroup:
+    return ScriptGroup(
+        id=str(uuid.uuid4()),
+        name=DEFAULT_SCRIPT_GROUP_NAME,
+        scripts=default_scripts(),
+    )
+
+
 def _copy_legacy_config_if_needed() -> None:
     if CONFIG_PATH.exists() or not LEGACY_CONFIG_PATH.exists() or LEGACY_CONFIG_PATH == CONFIG_PATH:
         return
@@ -1048,26 +1096,96 @@ def _copy_legacy_config_if_needed() -> None:
     CONFIG_PATH.write_text(LEGACY_CONFIG_PATH.read_text(encoding="utf-8"), encoding="utf-8")
 
 
-def _read_scripts_from_config(path: Path) -> list[Script]:
+def _normalize_script_groups(groups: list[ScriptGroup], active_group_id: str | None) -> tuple[list[ScriptGroup], str]:
+    normalized: list[ScriptGroup] = []
+    for index, group in enumerate(groups, start=1):
+        normalized.append(
+            ScriptGroup(
+                id=str(group.id or uuid.uuid4()),
+                name=str(group.name or "").strip() or f"設定組 {index}",
+                scripts=[script.clone() for script in group.scripts],
+            )
+        )
+
+    if not normalized:
+        fallback_group = default_script_group()
+        return [fallback_group], fallback_group.id
+
+    normalized_active_group_id = str(active_group_id or "").strip()
+    if normalized_active_group_id not in {group.id for group in normalized}:
+        normalized_active_group_id = normalized[0].id
+    return normalized, normalized_active_group_id
+
+
+def _read_script_groups_from_config(path: Path) -> tuple[list[ScriptGroup], str]:
     data = json.loads(path.read_text(encoding="utf-8"))
-    return [Script.from_dict(item) for item in data.get("scripts", [])]
+    if isinstance(data, dict) and isinstance(data.get("groups"), list):
+        groups: list[ScriptGroup] = []
+        for index, item in enumerate(data["groups"], start=1):
+            if not isinstance(item, dict):
+                raise ValueError(f"第 {index} 個設定組格式不正確。")
+            groups.append(ScriptGroup.from_dict(item, f"設定組 {index}"))
+        return _normalize_script_groups(groups, str(data.get("active_group_id") or ""))
+
+    if isinstance(data, dict) and "scripts" in data:
+        scripts = _scripts_from_raw_config(data.get("scripts"))
+        group_name = str(data.get("group_name") or data.get("name") or DEFAULT_SCRIPT_GROUP_NAME)
+    elif isinstance(data, list):
+        scripts = _scripts_from_raw_config(data)
+        group_name = DEFAULT_SCRIPT_GROUP_NAME
+    else:
+        raise ValueError("設定檔格式不正確，找不到 scripts 或 groups。")
+
+    legacy_group = ScriptGroup(
+        id=str(uuid.uuid4()),
+        name=group_name.strip() or DEFAULT_SCRIPT_GROUP_NAME,
+        scripts=scripts,
+    )
+    return [legacy_group], legacy_group.id
 
 
-def load_scripts() -> list[Script]:
+def load_script_groups() -> tuple[list[ScriptGroup], str]:
     try:
         _copy_legacy_config_if_needed()
         if not CONFIG_PATH.exists():
-            return default_scripts()
-        return _read_scripts_from_config(CONFIG_PATH)
+            fallback_group = default_script_group()
+            return [fallback_group], fallback_group.id
+        return _read_script_groups_from_config(CONFIG_PATH)
     except Exception as exc:
         messagebox.showwarning(APP_TITLE, f"讀取設定檔失敗，已載入預設範例。\n\n{exc}")
-        return default_scripts()
+        fallback_group = default_script_group()
+        return [fallback_group], fallback_group.id
+
+
+def load_scripts() -> list[Script]:
+    groups, active_group_id = load_script_groups()
+    active_group = next((group for group in groups if group.id == active_group_id), groups[0])
+    return active_group.scripts
+
+
+def save_script_groups(groups: list[ScriptGroup], active_group_id: str) -> None:
+    normalized_groups, normalized_active_group_id = _normalize_script_groups(groups, active_group_id)
+    active_group = next(
+        group for group in normalized_groups if group.id == normalized_active_group_id
+    )
+    data = {
+        "format": SCRIPT_GROUP_CONFIG_FORMAT,
+        "version": SCRIPT_GROUP_CONFIG_VERSION,
+        "active_group_id": normalized_active_group_id,
+        "groups": [group.to_dict() for group in normalized_groups],
+        "scripts": [script.to_dict() for script in active_group.scripts],
+    }
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def save_scripts(scripts: list[Script]) -> None:
-    data = {"scripts": [script.to_dict() for script in scripts]}
-    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    group = ScriptGroup(
+        id=str(uuid.uuid4()),
+        name=DEFAULT_SCRIPT_GROUP_NAME,
+        scripts=[script.clone() for script in scripts],
+    )
+    save_script_groups([group], group.id)
 
 
 @dataclass
@@ -3422,7 +3540,7 @@ class AutoKeyboardApp:
         self.root.minsize(980, 620)
         self._set_window_icon()
 
-        self.scripts = load_scripts()
+        self.script_groups, self.active_group_id = load_script_groups()
         self.recaptcha_settings = load_recaptcha_monitor_settings()
         self.running_overlay_settings = load_running_overlay_settings()
         self.keyboard = WindowsKeyboard()
@@ -3464,9 +3582,12 @@ class AutoKeyboardApp:
         self._step_drag_start_row: str | None = None
         self._step_drag_started_on_selection = False
         self._step_clipboard: list[Step] = []
+        self._group_choice_by_label: dict[str, str] = {}
+        self._group_label_by_id: dict[str, str] = {}
         self._script_call_choice_by_label: dict[str, str] = {}
         self._script_call_label_by_id: dict[str, str] = {}
 
+        self.group_var = tk.StringVar()
         self.name_var = tk.StringVar()
         self.hotkey_var = tk.StringVar()
         self.hotkey_hint_var = tk.StringVar(value="按「綁定」設定腳本快捷鍵")
@@ -3502,6 +3623,7 @@ class AutoKeyboardApp:
         self.recaptcha_monitor.set_settings(self.recaptcha_settings)
         self.recaptcha_monitor.start()
         self._update_recaptcha_status_from_settings(saved=False)
+        self._refresh_group_choices()
         self._refresh_script_tree()
         self._select_first_script()
         self._register_hotkeys(show_dialog=False)
@@ -3510,6 +3632,31 @@ class AutoKeyboardApp:
         self._poll_window_events()
         self._sync_running_overlay()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    @property
+    def scripts(self) -> list[Script]:
+        return self._ensure_active_group().scripts
+
+    @scripts.setter
+    def scripts(self, value: list[Script]) -> None:
+        self._ensure_active_group().scripts = value
+
+    def _find_group(self, group_id: str) -> ScriptGroup | None:
+        return next((group for group in getattr(self, "script_groups", []) if group.id == group_id), None)
+
+    def _ensure_active_group(self) -> ScriptGroup:
+        script_groups = getattr(self, "script_groups", None)
+        if not script_groups:
+            fallback_group = default_script_group()
+            self.script_groups = [fallback_group]
+            self.active_group_id = fallback_group.id
+            return fallback_group
+
+        active_group = self._find_group(str(getattr(self, "active_group_id", "") or ""))
+        if active_group is None:
+            active_group = script_groups[0]
+            self.active_group_id = active_group.id
+        return active_group
 
     def _set_window_icon(self) -> None:
         icon_path = resource_path("assets/AutoKeyboard.ico")
@@ -3565,6 +3712,7 @@ class AutoKeyboardApp:
         style.configure("AppTitle.TLabel", background=colors["surface"], foreground=colors["text"], font=app_font)
         style.configure("Title.TLabel", background=colors["surface"], foreground=colors["text"], font=title_font)
         style.configure("Small.TLabel", background=colors["surface"], foreground=colors["muted"])
+        style.configure("Error.Small.TLabel", background=colors["surface"], foreground=colors["danger"])
         style.configure(
             "Banner.Idle.TLabel",
             background=colors["idle_bg"],
@@ -3602,6 +3750,8 @@ class AutoKeyboardApp:
             fieldbackground="#ffffff",
             background="#ffffff",
             foreground=colors["text"],
+            selectbackground="#dbeafe",
+            selectforeground=colors["text"],
             bordercolor=colors["input_border"],
             lightcolor=colors["input_border"],
             darkcolor=colors["input_border"],
@@ -3610,6 +3760,9 @@ class AutoKeyboardApp:
         style.map(
             "Recipient.TCombobox",
             fieldbackground=[("readonly", "#ffffff")],
+            foreground=[("readonly", colors["text"]), ("focus", colors["text"])],
+            selectbackground=[("readonly", "#dbeafe"), ("focus", "#dbeafe")],
+            selectforeground=[("readonly", colors["text"]), ("focus", colors["text"])],
             bordercolor=[("focus", colors["primary"])],
             arrowcolor=[("active", colors["primary_hover"])],
         )
@@ -3657,8 +3810,7 @@ class AutoKeyboardApp:
             background=[("selected", "#dbeafe")],
             foreground=[("selected", colors["text"])],
         )
-        style.configure("TCheckbutton", background=colors["surface"], foreground=colors["text"])
-        style.map("TCheckbutton", background=[("active", colors["surface"])])
+        self._configure_checkbutton_style(style)
         style.configure("TRadiobutton", background=colors["surface"], foreground=colors["text"])
         style.map("TRadiobutton", background=[("active", colors["surface"])])
         style.configure(
@@ -3669,6 +3821,125 @@ class AutoKeyboardApp:
             font=("Microsoft JhengHei UI", 12),
         )
         style.map("Large.TRadiobutton", background=[("active", colors["surface"])])
+
+    def _configure_checkbutton_style(self, style: ttk.Style) -> None:
+        colors = self.colors
+        images = self._build_checkbutton_images()
+        self._checkbutton_images = images
+        element_name = "AutoKeyboard.Checkbutton.indicator"
+        try:
+            style.element_create(
+                element_name,
+                "image",
+                images["off"],
+                ("disabled", "selected", images["disabled_on"]),
+                ("disabled", images["disabled_off"]),
+                ("selected", images["on"]),
+                sticky="w",
+            )
+        except tk.TclError:
+            pass
+
+        style.layout(
+            "TCheckbutton",
+            [
+                (
+                    "Checkbutton.padding",
+                    {
+                        "sticky": "nswe",
+                        "children": [
+                            (element_name, {"side": "left", "sticky": "w"}),
+                            (
+                                "Checkbutton.focus",
+                                {
+                                    "side": "left",
+                                    "sticky": "w",
+                                    "children": [("Checkbutton.label", {"sticky": "nswe"})],
+                                },
+                            ),
+                        ],
+                    },
+                )
+            ],
+        )
+        style.configure(
+            "TCheckbutton",
+            background=colors["surface"],
+            foreground=colors["text"],
+            padding=(0, 4),
+        )
+        style.map(
+            "TCheckbutton",
+            background=[("active", colors["surface"])],
+            foreground=[("disabled", "#94a3b8")],
+        )
+
+    def _build_checkbutton_images(self) -> dict[str, tk.PhotoImage]:
+        colors = self.colors
+        return {
+            "off": self._build_checkbutton_image(
+                border=colors["input_border"],
+                fill="#ffffff",
+                highlight="#f8fafc",
+            ),
+            "on": self._build_checkbutton_image(
+                border=colors["primary"],
+                fill=colors["primary"],
+                highlight="#60a5fa",
+                check="#ffffff",
+            ),
+            "disabled_off": self._build_checkbutton_image(
+                border=colors["line"],
+                fill="#f1f5f9",
+                highlight="#f8fafc",
+            ),
+            "disabled_on": self._build_checkbutton_image(
+                border=colors["line"],
+                fill="#cbd5e1",
+                highlight="#e2e8f0",
+                check="#ffffff",
+            ),
+        }
+
+    def _build_checkbutton_image(
+        self,
+        *,
+        border: str,
+        fill: str,
+        highlight: str,
+        check: str | None = None,
+    ) -> tk.PhotoImage:
+        image = tk.PhotoImage(width=24, height=24)
+        self._fill_photo_rect(image, 2, 2, 22, 22, border)
+        self._fill_photo_rect(image, 3, 3, 21, 21, fill)
+        self._fill_photo_rect(image, 4, 4, 20, 5, highlight)
+        self._fill_photo_rect(image, 4, 4, 5, 20, highlight)
+        if check is not None:
+            self._draw_checkbox_checkmark(image, check)
+        return image
+
+    def _draw_checkbox_checkmark(self, image: tk.PhotoImage, color: str) -> None:
+        for x1, y1, x2, y2 in (
+            (6, 12, 8, 14),
+            (8, 14, 10, 16),
+            (10, 16, 12, 18),
+            (11, 15, 13, 17),
+            (13, 13, 15, 15),
+            (15, 11, 17, 13),
+            (17, 9, 19, 11),
+        ):
+            self._fill_photo_rect(image, x1, y1, x2, y2, color)
+
+    def _fill_photo_rect(
+        self,
+        image: tk.PhotoImage,
+        x1: int,
+        y1: int,
+        x2: int,
+        y2: int,
+        color: str,
+    ) -> None:
+        image.put(color, to=(x1, y1, x2, y2))
 
     def _build_ui(self) -> None:
         self.root.columnconfigure(0, weight=1)
@@ -3706,10 +3977,36 @@ class AutoKeyboardApp:
         paned.add(left, weight=1)
         paned.add(right, weight=3)
 
-        left.rowconfigure(1, weight=1)
+        left.rowconfigure(3, weight=1)
         left.columnconfigure(0, weight=1)
 
-        ttk.Label(left, text="腳本", style="Title.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 10))
+        ttk.Label(left, text="設定組", style="Title.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 10))
+
+        group_controls = ttk.Frame(left, style="Toolbar.TFrame")
+        group_controls.grid(row=1, column=0, sticky="ew", pady=(0, 12))
+        for column in range(3):
+            group_controls.columnconfigure(column, weight=1)
+
+        self.group_combo = ttk.Combobox(
+            group_controls,
+            textvariable=self.group_var,
+            values=(),
+            state="readonly",
+            style="Recipient.TCombobox",
+        )
+        self.group_combo.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 8))
+        self.group_combo.bind("<<ComboboxSelected>>", self._on_group_selected)
+        ttk.Button(group_controls, text="新增組", style="Primary.TButton", command=self._add_script_group).grid(
+            row=1, column=0, sticky="ew", padx=(0, 4)
+        )
+        ttk.Button(group_controls, text="更名", style="Ghost.TButton", command=self._rename_script_group).grid(
+            row=1, column=1, sticky="ew", padx=4
+        )
+        ttk.Button(group_controls, text="刪除組", style="Danger.TButton", command=self._delete_script_group).grid(
+            row=1, column=2, sticky="ew", padx=(4, 0)
+        )
+
+        ttk.Label(left, text="腳本", style="Title.TLabel").grid(row=2, column=0, sticky="w", pady=(0, 10))
 
         self.script_tree = ttk.Treeview(left, columns=("name", "hotkey", "status"), show="headings", selectmode="browse")
         self.script_tree.heading("name", text="名稱")
@@ -3721,14 +4018,14 @@ class AutoKeyboardApp:
         self.script_tree.tag_configure("running", background="#dbeafe")
         self.script_tree.tag_configure("stopping", background="#fef3c7")
         self.script_tree.tag_configure("script_dragging", background="#bfdbfe")
-        self.script_tree.grid(row=1, column=0, sticky="nsew")
+        self.script_tree.grid(row=3, column=0, sticky="nsew")
         self.script_tree.bind("<<TreeviewSelect>>", self._on_script_selected)
         self.script_tree.bind("<ButtonPress-1>", self._on_script_drag_start)
         self.script_tree.bind("<B1-Motion>", self._on_script_drag_motion)
         self.script_tree.bind("<ButtonRelease-1>", self._on_script_drag_release)
 
         script_buttons = ttk.Frame(left, style="Toolbar.TFrame")
-        script_buttons.grid(row=2, column=0, sticky="ew", pady=(12, 0))
+        script_buttons.grid(row=4, column=0, sticky="ew", pady=(12, 0))
         for column in range(3):
             script_buttons.columnconfigure(column, weight=1)
 
@@ -3756,7 +4053,7 @@ class AutoKeyboardApp:
         self.toggle_button.grid(row=1, column=2, sticky="ew", padx=(4, 0), pady=(8, 0))
 
         overlay_frame = ttk.Frame(left, style="Panel.TFrame")
-        overlay_frame.grid(row=3, column=0, sticky="ew", pady=(12, 0))
+        overlay_frame.grid(row=5, column=0, sticky="ew", pady=(12, 0))
         overlay_frame.columnconfigure(1, weight=1)
         ttk.Checkbutton(
             overlay_frame,
@@ -3783,9 +4080,9 @@ class AutoKeyboardApp:
             anchor="e",
         ).grid(row=1, column=2, sticky="e", pady=(8, 0))
 
-        ttk.Separator(left).grid(row=4, column=0, sticky="ew", pady=(14, 10))
+        ttk.Separator(left).grid(row=6, column=0, sticky="ew", pady=(14, 10))
         monitor_frame = ttk.Frame(left, style="Panel.TFrame")
-        monitor_frame.grid(row=5, column=0, sticky="ew")
+        monitor_frame.grid(row=7, column=0, sticky="ew")
         monitor_frame.columnconfigure(1, weight=1)
 
         ttk.Label(monitor_frame, text="測謊偵測", style="Title.TLabel").grid(
@@ -4059,6 +4356,27 @@ class AutoKeyboardApp:
             return f"{script.name} ({script.id[:8]})"
         return script.name
 
+    def _group_label(self, group: ScriptGroup, name_counts: dict[str, int] | None = None) -> str:
+        if name_counts is None:
+            name_counts = {item.name: sum(1 for group_item in self.script_groups if group_item.name == item.name) for item in self.script_groups}
+        if name_counts.get(group.name, 0) > 1:
+            return f"{group.name} ({group.id[:8]})"
+        return group.name
+
+    def _refresh_group_choices(self) -> None:
+        if not hasattr(self, "group_combo"):
+            return
+
+        name_counts: dict[str, int] = {}
+        for group in self.script_groups:
+            name_counts[group.name] = name_counts.get(group.name, 0) + 1
+
+        options = [(self._group_label(group, name_counts), group.id) for group in self.script_groups]
+        self._group_choice_by_label = {label: group_id for label, group_id in options}
+        self._group_label_by_id = {group_id: label for label, group_id in options}
+        self.group_combo.configure(values=[label for label, _group_id in options])
+        self.group_var.set(self._group_label_by_id.get(self.active_group_id, ""))
+
     def _refresh_script_call_choices(self) -> None:
         if not hasattr(self, "step_script_combo"):
             return
@@ -4114,11 +4432,216 @@ class AutoKeyboardApp:
             return f"找不到腳本 ({step.script_id[:8]})"
         return "未選擇腳本"
 
+    def _default_new_group_name(self) -> str:
+        existing_names = {group.name for group in self.script_groups}
+        counter = 1
+        while f"設定組 {counter}" in existing_names:
+            counter += 1
+        return f"設定組 {counter}"
+
+    def _prompt_text_dialog(
+        self,
+        *,
+        title: str,
+        prompt: str,
+        initial_value: str,
+        confirm_text: str = "確定",
+        validator: Callable[[str], str | None] | None = None,
+    ) -> str | None:
+        result: str | None = None
+        window = tk.Toplevel(self.root)
+        window.title(title)
+        window.transient(self.root)
+        window.resizable(False, False)
+        window.configure(bg=self.colors["bg"])
+
+        frame = ttk.Frame(window, style="Panel.TFrame", padding=18)
+        frame.grid(row=0, column=0, sticky="nsew")
+        frame.columnconfigure(0, weight=1)
+        ttk.Label(frame, text=title, style="Title.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(frame, text=prompt, style="Small.TLabel").grid(row=1, column=0, sticky="w", pady=(4, 0))
+
+        value_var = tk.StringVar(value=initial_value)
+        entry = RoundedEntry(frame, textvariable=value_var, colors=self.colors)
+        entry.grid(row=2, column=0, sticky="ew", pady=(12, 0))
+
+        error_var = tk.StringVar(value="")
+        ttk.Label(
+            frame,
+            textvariable=error_var,
+            style="Error.Small.TLabel",
+            wraplength=320,
+        ).grid(row=3, column=0, sticky="w", pady=(8, 0))
+
+        buttons = ttk.Frame(frame, style="Toolbar.TFrame")
+        buttons.grid(row=4, column=0, sticky="e", pady=(16, 0))
+
+        def cancel() -> None:
+            window.destroy()
+
+        def submit() -> None:
+            nonlocal result
+            normalized_value = value_var.get().strip()
+            error = validator(normalized_value) if validator is not None else None
+            if error is not None:
+                error_var.set(error)
+                entry.focus_set()
+                entry.selection_range(0, tk.END)
+                return
+
+            result = normalized_value
+            window.destroy()
+
+        ttk.Button(buttons, text="取消", style="Ghost.TButton", command=cancel).grid(row=0, column=0, padx=(0, 8))
+        ttk.Button(buttons, text=confirm_text, style="Primary.TButton", command=submit).grid(row=0, column=1)
+
+        window.protocol("WM_DELETE_WINDOW", cancel)
+        window.bind("<Escape>", lambda _event: cancel())
+        window.bind("<Return>", lambda _event: submit())
+        window.bind("<KP_Enter>", lambda _event: submit())
+        self._center_window(window)
+        window.grab_set()
+        entry.focus_set()
+        entry.selection_range(0, tk.END)
+        self.root.wait_window(window)
+        return result
+
+    def _prompt_group_name(
+        self,
+        title: str,
+        initial_value: str,
+        exclude_group_id: str | None = None,
+    ) -> str | None:
+        def validate(normalized_name: str) -> str | None:
+            if not normalized_name:
+                return "設定組名稱不能是空白。"
+
+            duplicate = next(
+                (
+                    group
+                    for group in self.script_groups
+                    if group.id != exclude_group_id and group.name == normalized_name
+                ),
+                None,
+            )
+            if duplicate is not None:
+                return f"設定組名稱「{normalized_name}」已存在。"
+            return None
+
+        return self._prompt_text_dialog(
+            title=title,
+            prompt="請輸入設定組名稱：",
+            initial_value=initial_value,
+            confirm_text="確定",
+            validator=validate,
+        )
+
+    def _ensure_group_change_allowed(self, action_text: str) -> bool:
+        if not self.runners:
+            return True
+
+        message = f"請先停止執行中的腳本，再{action_text}設定組。"
+        self.status_var.set(message)
+        messagebox.showwarning(APP_TITLE, message)
+        self._refresh_group_choices()
+        return False
+
+    def _switch_script_group(self, group_id: str, *, save: bool, status_message: str | None = None) -> bool:
+        group = self._find_group(group_id)
+        if group is None:
+            return False
+
+        self.active_group_id = group.id
+        self._refresh_group_choices()
+        self._refresh_script_tree()
+        self._select_first_script()
+        self._register_hotkeys(show_dialog=False)
+        if save:
+            self._save_all()
+        if status_message is not None:
+            self.status_var.set(status_message)
+        return True
+
+    def _on_group_selected(self, _event: tk.Event | None = None) -> None:
+        group_id = self._group_choice_by_label.get(self.group_var.get(), "")
+        if not group_id or group_id == self.active_group_id:
+            self._refresh_group_choices()
+            return
+
+        group = self._find_group(group_id)
+        if group is None:
+            self._refresh_group_choices()
+            return
+        if not self._ensure_group_change_allowed("切換"):
+            return
+
+        self._switch_script_group(group.id, save=True, status_message=f"已切換到設定組「{group.name}」。")
+
+    def _add_script_group(self) -> None:
+        if not self._ensure_group_change_allowed("新增"):
+            return
+
+        name = self._prompt_group_name("新增設定組", self._default_new_group_name())
+        if name is None:
+            return
+
+        group = ScriptGroup(id=str(uuid.uuid4()), name=name, scripts=[])
+        self.script_groups.append(group)
+        self._switch_script_group(group.id, save=True, status_message=f"已新增設定組「{group.name}」。")
+
+    def _rename_script_group(self) -> None:
+        group = self._ensure_active_group()
+        name = self._prompt_group_name("重新命名設定組", group.name, exclude_group_id=group.id)
+        if name is None or name == group.name:
+            return
+
+        group.name = name
+        self._save_all()
+        self._refresh_group_choices()
+        self.status_var.set(f"已將設定組改名為「{group.name}」。")
+
+    def _delete_script_group(self) -> None:
+        if len(self.script_groups) <= 1:
+            messagebox.showwarning(APP_TITLE, "至少要保留 1 個設定組。")
+            return
+        if not self._ensure_group_change_allowed("刪除"):
+            return
+
+        group = self._ensure_active_group()
+        message = f"確定刪除設定組「{group.name}」？"
+        if group.scripts:
+            message += f"\n\n這個設定組內有 {len(group.scripts)} 個腳本。"
+        if not messagebox.askyesno(APP_TITLE, message):
+            return
+
+        for script in group.scripts:
+            self.current_step.pop(script.id, None)
+
+        deleted_group_name = group.name
+        current_index = self.script_groups.index(group)
+        self.script_groups = [item for item in self.script_groups if item.id != group.id]
+        next_group = self.script_groups[min(current_index, len(self.script_groups) - 1)]
+        self._switch_script_group(next_group.id, save=True, status_message=f"已刪除設定組「{deleted_group_name}」。")
+
+    def _clear_script_editor(self) -> None:
+        self._loading_script = True
+        try:
+            self.name_var.set("")
+            self.hotkey_var.set("")
+            self.repeat_var.set(True)
+        finally:
+            self._loading_script = False
+        self.hotkey_hint_var.set("按「綁定」設定腳本快捷鍵")
+        self._refresh_step_tree(None)
+        self._update_toggle_button()
+
     def _select_first_script(self) -> None:
         if self.scripts:
             self.script_tree.selection_set(self.scripts[0].id)
             self.script_tree.focus(self.scripts[0].id)
             self._load_script_into_editor(self.scripts[0])
+        else:
+            self._clear_script_editor()
 
     def _refresh_script_tree(self) -> None:
         selected = self._selected_script_id()
@@ -4552,9 +5075,14 @@ class AutoKeyboardApp:
 
     def _update_toggle_button(self) -> None:
         script_id = self._selected_script_id()
-        if script_id in self.runners:
+        if script_id is None:
+            self.toggle_button.state(["disabled"])
+            self.toggle_button.configure(text="啟動", style="Primary.TButton")
+        elif script_id in self.runners:
+            self.toggle_button.state(["!disabled"])
             self.toggle_button.configure(text="停止", style="Danger.TButton")
         else:
+            self.toggle_button.state(["!disabled"])
             self.toggle_button.configure(text="啟動", style="Primary.TButton")
 
     def _on_script_selected(self, _event: tk.Event | None = None) -> None:
@@ -4646,9 +5174,127 @@ class AutoKeyboardApp:
         self._select_first_script()
         self.status_var.set("已刪除腳本。")
 
+    def _choose_scripts_for_export(self) -> list[Script] | None:
+        selected_ids: list[str] | None = None
+        window = tk.Toplevel(self.root)
+        window.title("選擇匯出腳本")
+        window.transient(self.root)
+        window.resizable(False, False)
+
+        frame = ttk.Frame(window, style="Panel.TFrame", padding=16)
+        frame.grid(row=0, column=0, sticky="nsew")
+        frame.columnconfigure(0, weight=1)
+
+        ttk.Label(frame, text="選擇要匯出的腳本", style="Title.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            frame,
+            text=f"目前設定組：{self._ensure_active_group().name}",
+            style="Small.TLabel",
+        ).grid(row=1, column=0, sticky="w", pady=(4, 0))
+
+        select_all_var = tk.BooleanVar(value=True)
+        script_vars = {script.id: tk.BooleanVar(value=True) for script in self.scripts}
+
+        def toggle_all() -> None:
+            value = bool(select_all_var.get())
+            for variable in script_vars.values():
+                variable.set(value)
+
+        def sync_select_all_state() -> None:
+            all_selected = all(variable.get() for variable in script_vars.values())
+            if select_all_var.get() != all_selected:
+                select_all_var.set(all_selected)
+
+        ttk.Checkbutton(
+            frame,
+            text="全選匯出",
+            variable=select_all_var,
+            command=toggle_all,
+        ).grid(row=2, column=0, sticky="w", pady=(10, 6))
+
+        list_frame = ttk.Frame(frame, style="Panel.TFrame")
+        list_frame.grid(row=3, column=0, sticky="ew")
+        list_frame.columnconfigure(0, weight=1)
+        for index, script in enumerate(self.scripts):
+            hotkey_label = script.hotkey or "未綁定"
+            ttk.Checkbutton(
+                list_frame,
+                text=f"{script.name} ({hotkey_label})",
+                variable=script_vars[script.id],
+                command=sync_select_all_state,
+            ).grid(row=index, column=0, sticky="w", pady=(0 if index == 0 else 4, 0))
+
+        buttons = ttk.Frame(frame, style="Toolbar.TFrame")
+        buttons.grid(row=4, column=0, sticky="e", pady=(14, 0))
+        ttk.Button(buttons, text="取消", style="Ghost.TButton", command=window.destroy).grid(
+            row=0, column=0, padx=(0, 8)
+        )
+
+        def submit() -> None:
+            nonlocal selected_ids
+            chosen_ids = [script_id for script_id, variable in script_vars.items() if variable.get()]
+            if not chosen_ids:
+                messagebox.showwarning(APP_TITLE, "請至少勾選 1 個腳本。", parent=window)
+                return
+            selected_ids = chosen_ids
+            window.destroy()
+
+        ttk.Button(buttons, text="匯出", style="Primary.TButton", command=submit).grid(row=0, column=1)
+        window.protocol("WM_DELETE_WINDOW", window.destroy)
+        window.bind("<Escape>", lambda _event: window.destroy())
+        self._center_window(window)
+        window.grab_set()
+        window.focus_force()
+        self.root.wait_window(window)
+
+        if selected_ids is None:
+            return None
+
+        selected_id_set = set(selected_ids)
+        return [script for script in self.scripts if script.id in selected_id_set]
+
+    def _missing_export_dependencies(self, scripts: list[Script]) -> list[tuple[str, str]]:
+        selected_lookup = {script.id: script for script in scripts}
+        current_lookup = {script.id: script for script in self.scripts}
+        missing: list[tuple[str, str]] = []
+        for script in scripts:
+            seen_targets: set[str] = set()
+            for step in script.steps:
+                if not step.needs_script() or not step.script_id or step.script_id in selected_lookup:
+                    continue
+                target = current_lookup.get(step.script_id)
+                target_name = target.name if target is not None else f"未知腳本 ({step.script_id[:8]})"
+                if target_name in seen_targets:
+                    continue
+                seen_targets.add(target_name)
+                missing.append((script.name, target_name))
+        return missing
+
+    def _missing_export_dependency_message(self, missing_dependencies: list[tuple[str, str]]) -> str:
+        lines = [f"- {script_name} 需要 {target_name}" for script_name, target_name in missing_dependencies[:6]]
+        remaining = len(missing_dependencies) - len(lines)
+        if remaining > 0:
+            lines.append(f"- 另外還有 {remaining} 個未包含的呼叫關係")
+        return (
+            "你選取的腳本缺少被呼叫的相依腳本，匯出後可能無法直接執行。\n\n"
+            + "\n".join(lines)
+            + "\n\n仍要繼續匯出嗎？"
+        )
+
     def _export_scripts(self) -> None:
         if not self.scripts:
             messagebox.showwarning(APP_TITLE, "沒有可匯出的腳本。")
+            return
+
+        selected_scripts = self._choose_scripts_for_export()
+        if selected_scripts is None:
+            return
+
+        missing_dependencies = self._missing_export_dependencies(selected_scripts)
+        if missing_dependencies and not messagebox.askyesno(
+            APP_TITLE,
+            self._missing_export_dependency_message(missing_dependencies),
+        ):
             return
 
         path = filedialog.asksaveasfilename(
@@ -4665,8 +5311,9 @@ class AutoKeyboardApp:
             "app": APP_NAME,
             "format": "autokeyboard.scripts",
             "version": 1,
+            "group_name": self._ensure_active_group().name,
             "exported_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "scripts": [script.to_dict() for script in self.scripts],
+            "scripts": [script.to_dict() for script in selected_scripts],
         }
         try:
             Path(path).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -4674,7 +5321,7 @@ class AutoKeyboardApp:
             messagebox.showerror(APP_TITLE, f"匯出失敗：\n{exc}")
             return
 
-        self.status_var.set(f"已匯出 {len(self.scripts)} 個腳本。")
+        self.status_var.set(f"已匯出 {len(selected_scripts)} 個腳本。")
 
     def _import_scripts(self) -> None:
         path = filedialog.askopenfilename(
@@ -4930,7 +5577,7 @@ class AutoKeyboardApp:
         return None
 
     def _save_all(self) -> None:
-        save_scripts(self.scripts)
+        save_script_groups(self.script_groups, self.active_group_id)
 
     def _register_hotkeys(self, show_dialog: bool) -> None:
         errors = self.hotkeys.set_hotkeys(self.scripts)
@@ -5816,10 +6463,20 @@ class AutoKeyboardApp:
 
     def _stop_all_running_scripts(self) -> int:
         stopped_count = 0
+        runners_to_join: list[object] = []
         for script_id, runner in list(self.runners.items()):
             runner.stop()
             self.current_step[script_id] = "停止中"
+            runners_to_join.append(runner)
             stopped_count += 1
+
+        for runner in runners_to_join:
+            join = getattr(runner, "join", None)
+            if callable(join):
+                try:
+                    join(RUNNER_STOP_WAIT_SECONDS)
+                except Exception:
+                    pass
 
         if stopped_count:
             self._refresh_script_tree()
@@ -5852,9 +6509,11 @@ class AutoKeyboardApp:
                 break
 
             if event_type == "started":
-                self.current_step[script_id] = "執行中"
+                if self.current_step.get(script_id) != "停止中":
+                    self.current_step[script_id] = "執行中"
             elif event_type == "step":
-                self.current_step[script_id] = detail
+                if self.current_step.get(script_id) != "停止中":
+                    self.current_step[script_id] = detail
             elif event_type == "error":
                 self.status_var.set(f"腳本錯誤：{detail}")
             elif event_type == "stopped":

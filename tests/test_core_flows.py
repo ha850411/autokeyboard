@@ -141,6 +141,51 @@ class ConfigPersistenceTests(unittest.TestCase):
 
         self.assertEqual([script.to_dict() for script in loaded], [script.to_dict() for script in scripts])
 
+    def test_save_and_load_script_groups_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "scripts.json"
+            legacy_path = Path(directory) / "legacy.json"
+            group_one = ak.ScriptGroup(
+                id="group-1",
+                name="角色 A",
+                scripts=[ak.Script(id="script-a", name="A 腳本", steps=[ak.Step(ak.ACTION_DELAY, delay_ms=10)])],
+            )
+            group_two = ak.ScriptGroup(
+                id="group-2",
+                name="角色 B",
+                scripts=[ak.Script(id="script-b", name="B 腳本", steps=[ak.Step(ak.ACTION_DELAY, delay_ms=20)])],
+            )
+
+            with patch.object(ak, "CONFIG_PATH", config_path), patch.object(ak, "LEGACY_CONFIG_PATH", legacy_path):
+                ak.save_script_groups([group_one, group_two], group_two.id)
+                groups, active_group_id = ak.load_script_groups()
+                legacy_scripts = ak.load_scripts()
+                saved_data = ak.json.loads(config_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(active_group_id, "group-2")
+        self.assertEqual([group.name for group in groups], ["角色 A", "角色 B"])
+        self.assertEqual(groups[1].scripts[0].name, "B 腳本")
+        self.assertEqual([script.name for script in legacy_scripts], ["B 腳本"])
+        self.assertEqual(saved_data["scripts"], [group_two.scripts[0].to_dict()])
+
+    def test_load_script_groups_wraps_legacy_scripts_into_default_group(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "scripts.json"
+            legacy_path = Path(directory) / "legacy.json"
+            legacy_script = ak.Script(id="legacy", name="舊腳本", steps=[ak.Step(ak.ACTION_DELAY, delay_ms=10)])
+            config_path.write_text(
+                ak.json.dumps({"scripts": [legacy_script.to_dict()]}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            with patch.object(ak, "CONFIG_PATH", config_path), patch.object(ak, "LEGACY_CONFIG_PATH", legacy_path):
+                groups, active_group_id = ak.load_script_groups()
+
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0].name, ak.DEFAULT_SCRIPT_GROUP_NAME)
+        self.assertEqual(groups[0].id, active_group_id)
+        self.assertEqual(groups[0].scripts[0].to_dict(), legacy_script.to_dict())
+
     def test_load_scripts_copies_legacy_config_when_user_config_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config_path = Path(directory) / "user" / "scripts.json"
@@ -452,9 +497,14 @@ class FakeKeyboard:
 class FakeRunner:
     def __init__(self) -> None:
         self.stopped = False
+        self.join_calls: list[float | None] = []
 
     def stop(self) -> None:
         self.stopped = True
+
+    def join(self, timeout: float | None = None) -> bool:
+        self.join_calls.append(timeout)
+        return True
 
 
 class FakeStringVar:
@@ -588,6 +638,8 @@ class AutoKeyboardAppRuntimeTests(unittest.TestCase):
 
         self.assertTrue(first_runner.stopped)
         self.assertTrue(second_runner.stopped)
+        self.assertEqual(first_runner.join_calls, [ak.RUNNER_STOP_WAIT_SECONDS])
+        self.assertEqual(second_runner.join_calls, [ak.RUNNER_STOP_WAIT_SECONDS])
         self.assertEqual(app.current_step, {"first": "停止中", "second": "停止中"})
         self.assertEqual(refreshed, [True])
         self.assertEqual(app.status_var.value, "偵測到測謊。 已中止 2 個執行中的腳本。")
