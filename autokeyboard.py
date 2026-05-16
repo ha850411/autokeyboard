@@ -43,7 +43,7 @@ except ImportError:
 
 APP_TITLE = "AutoKeyboard 腳本精靈"
 APP_NAME = "AutoKeyboard"
-APP_VERSION = "1.5.2"
+APP_VERSION = "1.5.3"
 CONFIG_FILENAME = "scripts.json"
 MONITOR_CONFIG_FILENAME = "recaptcha_monitor.json"
 RUNNING_OVERLAY_CONFIG_FILENAME = "running_overlay.json"
@@ -53,6 +53,7 @@ UPDATE_VERSION_URL = f"https://raw.githubusercontent.com/{UPDATE_REPOSITORY}/{UP
 UPDATE_INSTALLER_URL = (
     f"https://raw.githubusercontent.com/{UPDATE_REPOSITORY}/{UPDATE_BRANCH}/installer/AutoKeyboard_Setup.exe"
 )
+UPDATE_INSTALLER_ARGUMENTS = ("/FORCECLOSEAPPLICATIONS", "/NORESTARTAPPLICATIONS")
 UPDATE_REQUEST_HEADERS = {
     "User-Agent": f"{APP_NAME}/{APP_VERSION}",
     "Cache-Control": "no-cache",
@@ -175,10 +176,11 @@ def download_update_installer(
 
 def launch_update_installer(installer_path: Path) -> None:
     path = Path(installer_path)
+    arguments = " ".join(UPDATE_INSTALLER_ARGUMENTS)
     if platform.system() == "Windows" and hasattr(os, "startfile"):
-        os.startfile(str(path))  # type: ignore[attr-defined]
+        os.startfile(str(path), "open", arguments, str(path.parent))  # type: ignore[attr-defined]
         return
-    subprocess.Popen([str(path)], cwd=str(path.parent))
+    subprocess.Popen([str(path), *UPDATE_INSTALLER_ARGUMENTS], cwd=str(path.parent))
 
 
 LEGACY_CONFIG_PATH = app_directory() / CONFIG_FILENAME

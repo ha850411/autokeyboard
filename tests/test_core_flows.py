@@ -352,6 +352,30 @@ class UpdateTests(unittest.TestCase):
         self.assertEqual(path.name, "AutoKeyboard_Setup_1.6.0.exe")
         self.assertEqual(downloaded, b"MZ fake installer")
 
+    def test_launch_update_installer_passes_force_close_arguments(self) -> None:
+        installer_path = Path("C:/Temp/AutoKeyboard_Setup.exe")
+
+        with (
+            patch.object(ak.platform, "system", return_value="Linux"),
+            patch("autokeyboard.subprocess.Popen") as popen,
+        ):
+            ak.launch_update_installer(installer_path)
+
+        popen.assert_called_once_with(
+            [str(installer_path), "/FORCECLOSEAPPLICATIONS", "/NORESTARTAPPLICATIONS"],
+            cwd=str(installer_path.parent),
+        )
+
+
+class InstallerScriptTests(unittest.TestCase):
+    def test_installer_force_closes_running_app_before_replacing_exe(self) -> None:
+        installer_text = (ROOT / "installer.iss").read_text(encoding="utf-8")
+
+        self.assertIn("CloseApplications=force", installer_text)
+        self.assertIn("RestartApplications=no", installer_text)
+        self.assertIn("/F /T /IM AutoKeyboard.exe", installer_text)
+        self.assertIn("function PrepareToInstall", installer_text)
+
 
 class TimeFormattingTests(unittest.TestCase):
     def test_seconds_and_text_to_ms(self) -> None:

@@ -1,7 +1,7 @@
 [Setup]
 AppId={{A9D31B90-EC5D-4A51-8792-55F52C39391C}
 AppName=AutoKeyboard
-AppVersion=1.5.3
+AppVersion=1.5.4
 AppPublisher=AutoKeyboard
 DefaultDirName={localappdata}\Programs\AutoKeyboard
 DefaultGroupName=AutoKeyboard
@@ -14,6 +14,9 @@ PrivilegesRequired=lowest
 UninstallDisplayIcon={app}\AutoKeyboard.exe
 SetupIconFile=assets\AutoKeyboard.ico
 WizardStyle=modern
+CloseApplications=force
+CloseApplicationsFilter=*.exe
+RestartApplications=no
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
@@ -27,3 +30,17 @@ Name: "{autodesktop}\AutoKeyboard"; Filename: "{app}\AutoKeyboard.exe"; Tasks: d
 
 [Run]
 Filename: "{app}\AutoKeyboard.exe"; Description: "{cm:LaunchProgram,AutoKeyboard}"; Flags: nowait postinstall skipifsilent
+
+[Code]
+procedure KillRunningAutoKeyboard();
+var
+  ResultCode: Integer;
+begin
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /T /IM AutoKeyboard.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  KillRunningAutoKeyboard();
+  Result := '';
+end;
