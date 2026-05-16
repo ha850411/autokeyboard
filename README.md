@@ -22,7 +22,7 @@
 
 ## 更新程式
 
-主畫面右上角的「檢查更新」會讀取 `ha850411/autokeyboard` 上的 `installer.iss` 版本，發現新版後下載 `installer/AutoKeyboard_Setup.exe`，並啟動安裝程式。
+主畫面右上角的「檢查更新」會讀取 `ha850411/autokeyboard` 上的 `version.txt` 版本，發現新版後下載 `installer/AutoKeyboard_Setup.exe`，並啟動安裝程式。
 
 新版步驟採用羅技巨集那種動作式流程：
 

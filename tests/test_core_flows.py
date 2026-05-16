@@ -299,6 +299,34 @@ class ConfigPersistenceTests(unittest.TestCase):
         self.assertEqual(loaded, ak.RunningOverlaySettings(enabled=False, opacity=0.45))
         self.assertEqual(saved_data, {"enabled": False, "opacity": 0.45})
 
+    def test_ui_scale_settings_round_trip_and_clamps(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            settings_path = Path(directory) / "ui_scale.json"
+
+            with patch.object(ak, "UI_SCALE_CONFIG_PATH", settings_path):
+                self.assertEqual(ak.load_ui_scale_settings(), ak.UiScaleSettings())
+
+                ak.save_ui_scale_settings(ak.UiScaleSettings(scale=1.25))
+                loaded = ak.load_ui_scale_settings()
+                saved_data = ak.json.loads(settings_path.read_text(encoding="utf-8"))
+
+                settings_path.write_text(ak.json.dumps({"scale": 99}, ensure_ascii=False), encoding="utf-8")
+                clamped = ak.load_ui_scale_settings()
+
+        self.assertEqual(loaded, ak.UiScaleSettings(scale=1.25))
+        self.assertEqual(saved_data, {"scale": 1.25})
+        self.assertEqual(clamped, ak.UiScaleSettings(scale=ak.UI_SCALE_MAX))
+
+    def test_ui_scale_settings_invalid_config_returns_default(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            settings_path = Path(directory) / "ui_scale.json"
+            settings_path.write_text("{not json", encoding="utf-8")
+
+            with patch.object(ak, "UI_SCALE_CONFIG_PATH", settings_path):
+                loaded = ak.load_ui_scale_settings()
+
+        self.assertEqual(loaded, ak.UiScaleSettings())
+
     def test_running_overlay_settings_clamps_opacity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             settings_path = Path(directory) / "running_overlay.json"
@@ -344,40 +372,50 @@ class FakeUrlopenResponse:
 
 
 class UpdateTests(unittest.TestCase):
-    def test_extract_app_version_from_installer_script(self) -> None:
+    def test_extract_app_version_supports_shared_version_sources(self) -> None:
+        self.assertEqual(ak.extract_app_version("1.6.0\n"), "1.6.0")
+        self.assertEqual(ak.extract_app_version("APP_VERSION=1.6.0\n"), "1.6.0")
         self.assertEqual(ak.extract_app_version("[Setup]\nAppName=AutoKeyboard\nAppVersion=1.6.0\n"), "1.6.0")
 
-        with self.assertRaisesRegex(ValueError, "找不到安裝檔版本資訊"):
+        with self.assertRaisesRegex(ValueError, "找不到版本資訊"):
             ak.extract_app_version("[Setup]\nAppName=AutoKeyboard\n")
 
-    def test_app_version_matches_installer_script(self) -> None:
+    def test_app_version_matches_shared_version_file(self) -> None:
+        version_text = (ROOT / "version.txt").read_text(encoding="utf-8")
+
+        self.assertEqual(ak.APP_VERSION, ak.extract_app_version(version_text))
+
+    def test_installer_script_reads_shared_version_file(self) -> None:
         installer_text = (ROOT / "installer.iss").read_text(encoding="utf-8")
 
-        self.assertEqual(ak.APP_VERSION, ak.extract_app_version(installer_text))
+        self.assertIn('#define VersionFileHandle FileOpen(AddBackslash(SourcePath) + "version.txt")', installer_text)
+        self.assertIn('#define MyAppVersion FileRead(VersionFileHandle)', installer_text)
+        self.assertIn('#expr FileClose(VersionFileHandle)', installer_text)
+        self.assertIn("AppVersion={#MyAppVersion}", installer_text)
 
     def test_compare_versions_uses_numeric_order(self) -> None:
         self.assertGreater(ak.compare_versions("1.10.0", "1.9.9"), 0)
         self.assertEqual(ak.compare_versions("v1.5.2", "1.5.2.0"), 0)
         self.assertLess(ak.compare_versions("1.5.2", "1.5.3"), 0)
 
-    def test_fetch_latest_update_info_reads_remote_installer_version(self) -> None:
+    def test_fetch_latest_update_info_reads_remote_shared_version(self) -> None:
         calls = []
 
         def fake_urlopen(request, timeout):
             calls.append((request, timeout))
-            return FakeUrlopenResponse(b"[Setup]\nAppVersion=1.6.0\n")
+            return FakeUrlopenResponse(b"1.6.0\n")
 
         with patch("autokeyboard.urllib.request.urlopen", side_effect=fake_urlopen):
             info = ak.fetch_latest_update_info(
                 current_version="1.5.2",
-                version_url="https://example.test/installer.iss",
+                version_url="https://example.test/version.txt",
                 installer_url="https://example.test/AutoKeyboard_Setup.exe",
             )
 
         self.assertTrue(info.has_update)
         self.assertEqual(info.latest_version, "1.6.0")
         self.assertEqual(info.installer_url, "https://example.test/AutoKeyboard_Setup.exe")
-        self.assertEqual(calls[0][0].full_url, "https://example.test/installer.iss")
+        self.assertEqual(calls[0][0].full_url, "https://example.test/version.txt")
 
     def test_download_update_installer_writes_versioned_exe(self) -> None:
         def fake_urlopen(_request, timeout):

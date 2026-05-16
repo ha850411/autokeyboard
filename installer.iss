@@ -1,7 +1,14 @@
+#define VersionFileHandle FileOpen(AddBackslash(SourcePath) + "version.txt")
+#if VersionFileHandle == 0
+  #error "無法讀取 version.txt"
+#endif
+#define MyAppVersion FileRead(VersionFileHandle)
+#expr FileClose(VersionFileHandle)
+
 [Setup]
 AppId={{A9D31B90-EC5D-4A51-8792-55F52C39391C}
 AppName=AutoKeyboard
-AppVersion=1.5.8
+AppVersion={#MyAppVersion}
 AppPublisher=AutoKeyboard
 DefaultDirName={localappdata}\Programs\AutoKeyboard
 DefaultGroupName=AutoKeyboard

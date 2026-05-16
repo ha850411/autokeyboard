@@ -43,29 +43,7 @@ except ImportError:
 
 APP_TITLE = "AutoKeyboard 腳本精靈"
 APP_NAME = "AutoKeyboard"
-APP_VERSION = "1.5.7"
-CONFIG_FILENAME = "scripts.json"
-SCRIPT_GROUP_CONFIG_FORMAT = "autokeyboard.script_groups"
-SCRIPT_GROUP_CONFIG_VERSION = 2
-DEFAULT_SCRIPT_GROUP_NAME = "設定組 1"
-MONITOR_CONFIG_FILENAME = "recaptcha_monitor.json"
-RUNNING_OVERLAY_CONFIG_FILENAME = "running_overlay.json"
-UPDATE_REPOSITORY = "ha850411/autokeyboard"
-UPDATE_BRANCH = "master"
-UPDATE_VERSION_URL = f"https://raw.githubusercontent.com/{UPDATE_REPOSITORY}/{UPDATE_BRANCH}/installer.iss"
-UPDATE_INSTALLER_URL = (
-    f"https://raw.githubusercontent.com/{UPDATE_REPOSITORY}/{UPDATE_BRANCH}/installer/AutoKeyboard_Setup.exe"
-)
-UPDATE_DELETE_SOURCE_INSTALLER_ARGUMENT = "/AUTOKEYBOARD_DELETE_SOURCE_INSTALLER=1"
-UPDATE_INSTALLER_ARGUMENTS = (
-    "/FORCECLOSEAPPLICATIONS",
-    "/NORESTARTAPPLICATIONS",
-    UPDATE_DELETE_SOURCE_INSTALLER_ARGUMENT,
-)
-UPDATE_REQUEST_HEADERS = {
-    "User-Agent": f"{APP_NAME}/{APP_VERSION}",
-    "Cache-Control": "no-cache",
-}
+VERSION_FILENAME = "version.txt"
 
 
 def app_directory() -> Path:
@@ -86,6 +64,56 @@ def user_data_directory() -> Path:
         base_directory = Path(os.environ.get("LOCALAPPDATA", str(fallback)))
         return base_directory / APP_NAME
     return Path.home() / f".{APP_NAME.lower()}"
+
+
+def extract_app_version(version_source_text: str) -> str:
+    stripped_text = version_source_text.strip()
+    if stripped_text and "\n" not in stripped_text and "\r" not in stripped_text and "=" not in stripped_text:
+        return stripped_text.strip('"\'')
+
+    for line in version_source_text.splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key.strip().lower() in {"appversion", "app_version"}:
+            version = value.strip().strip('"\'')
+            if version:
+                return version
+    raise ValueError("找不到版本資訊。")
+
+
+VERSION_FILE_PATH = resource_path(VERSION_FILENAME)
+
+
+def load_app_version(default: str = "0.0.0") -> str:
+    try:
+        return extract_app_version(VERSION_FILE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+
+APP_VERSION = load_app_version()
+CONFIG_FILENAME = "scripts.json"
+SCRIPT_GROUP_CONFIG_FORMAT = "autokeyboard.script_groups"
+SCRIPT_GROUP_CONFIG_VERSION = 2
+DEFAULT_SCRIPT_GROUP_NAME = "設定組 1"
+MONITOR_CONFIG_FILENAME = "recaptcha_monitor.json"
+RUNNING_OVERLAY_CONFIG_FILENAME = "running_overlay.json"
+UI_SCALE_CONFIG_FILENAME = "ui_scale.json"
+UPDATE_REPOSITORY = "ha850411/autokeyboard"
+UPDATE_BRANCH = "master"
+UPDATE_VERSION_URL = f"https://raw.githubusercontent.com/{UPDATE_REPOSITORY}/{UPDATE_BRANCH}/{VERSION_FILENAME}"
+UPDATE_INSTALLER_URL = (
+    f"https://raw.githubusercontent.com/{UPDATE_REPOSITORY}/{UPDATE_BRANCH}/installer/AutoKeyboard_Setup.exe"
+)
+UPDATE_DELETE_SOURCE_INSTALLER_ARGUMENT = "/AUTOKEYBOARD_DELETE_SOURCE_INSTALLER=1"
+UPDATE_INSTALLER_ARGUMENTS = (
+    "/FORCECLOSEAPPLICATIONS",
+    "/NORESTARTAPPLICATIONS",
+    UPDATE_DELETE_SOURCE_INSTALLER_ARGUMENT,
+)
+UPDATE_REQUEST_HEADERS = {
+    "User-Agent": f"{APP_NAME}/{APP_VERSION}",
+    "Cache-Control": "no-cache",
+}
 
 
 @dataclass(frozen=True)
@@ -124,16 +152,6 @@ def compare_versions(first: str, second: str) -> int:
     if first_parts < second_parts:
         return -1
     return 0
-
-
-def extract_app_version(installer_iss_text: str) -> str:
-    for line in installer_iss_text.splitlines():
-        key, separator, value = line.partition("=")
-        if separator and key.strip().lower() == "appversion":
-            version = value.strip()
-            if version:
-                return version
-    raise ValueError("找不到安裝檔版本資訊。")
 
 
 def fetch_text(url: str, *, timeout: float = 10.0) -> str:
@@ -195,6 +213,7 @@ LEGACY_CONFIG_PATH = app_directory() / CONFIG_FILENAME
 CONFIG_PATH = user_data_directory() / CONFIG_FILENAME
 MONITOR_CONFIG_PATH = user_data_directory() / MONITOR_CONFIG_FILENAME
 RUNNING_OVERLAY_CONFIG_PATH = user_data_directory() / RUNNING_OVERLAY_CONFIG_FILENAME
+UI_SCALE_CONFIG_PATH = user_data_directory() / UI_SCALE_CONFIG_FILENAME
 RECAPTCHA_TEMPLATE_PATH = resource_path("assets/check/recaptcha.png")
 RECAPTCHA_SCAN_INTERVAL_SECONDS = 0.5
 RECAPTCHA_FEATURE_SCAN_INTERVAL_SECONDS = 0.33
@@ -230,6 +249,14 @@ RECAPTCHA_MAX_NOTIFICATION_WORKERS = 3
 RUNNER_STOP_WAIT_SECONDS = 0.5
 DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
 PROCESS_PER_MONITOR_DPI_AWARE = 2
+UI_SCALE_MIN = 0.8
+UI_SCALE_MAX = 1.5
+UI_SCALE_DEFAULT = 1.0
+UI_SCALE_CHOICES = (0.8, 0.9, 1.0, 1.1, 1.25, 1.5)
+APP_WINDOW_WIDTH = 1120
+APP_WINDOW_HEIGHT = 720
+APP_WINDOW_MIN_WIDTH = 980
+APP_WINDOW_MIN_HEIGHT = 620
 
 
 def build_recaptcha_match_scales(
@@ -1238,6 +1265,11 @@ class RunningOverlaySettings:
     opacity: float = RUNNING_OVERLAY_ALPHA
 
 
+@dataclass
+class UiScaleSettings:
+    scale: float = UI_SCALE_DEFAULT
+
+
 def normalize_discord_user_id(value: str) -> str:
     return "".join(character for character in value.strip() if character.isdigit())
 
@@ -1316,6 +1348,20 @@ def format_running_overlay_opacity_label(value: float) -> str:
     return f"{int(round(clamp_running_overlay_opacity(value) * 100))}%"
 
 
+def clamp_ui_scale(value: float) -> float:
+    try:
+        scale = float(value)
+    except (TypeError, ValueError):
+        return UI_SCALE_DEFAULT
+    if scale != scale:
+        return UI_SCALE_DEFAULT
+    return max(UI_SCALE_MIN, min(UI_SCALE_MAX, scale))
+
+
+def format_ui_scale_label(value: float) -> str:
+    return f"{int(round(clamp_ui_scale(value) * 100))}%"
+
+
 def load_running_overlay_settings() -> RunningOverlaySettings:
     try:
         if not RUNNING_OVERLAY_CONFIG_PATH.exists():
@@ -1336,6 +1382,22 @@ def save_running_overlay_settings(settings: RunningOverlaySettings) -> None:
     }
     RUNNING_OVERLAY_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     RUNNING_OVERLAY_CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def load_ui_scale_settings() -> UiScaleSettings:
+    try:
+        if not UI_SCALE_CONFIG_PATH.exists():
+            return UiScaleSettings()
+        data = json.loads(UI_SCALE_CONFIG_PATH.read_text(encoding="utf-8"))
+        return UiScaleSettings(scale=clamp_ui_scale(data.get("scale", UI_SCALE_DEFAULT)))
+    except Exception:
+        return UiScaleSettings()
+
+
+def save_ui_scale_settings(settings: UiScaleSettings) -> None:
+    data = {"scale": clamp_ui_scale(settings.scale)}
+    UI_SCALE_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    UI_SCALE_CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def format_running_overlay_text(script_names: Iterable[str]) -> str:
@@ -3130,12 +3192,18 @@ class RoundedEntry(tk.Frame):
         textvariable: tk.StringVar,
         width: int | None = None,
         colors: dict[str, str] | None = None,
+        *,
+        height: int = 40,
+        radius: int = 9,
+        padding_x: int = 14,
     ) -> None:
         self.colors = colors or {}
         self.bg_color = self.colors.get("surface", "#ffffff")
         super().__init__(master, bg=self.bg_color, highlightthickness=0, bd=0)
 
-        self.radius = 9
+        self.radius = max(4, int(radius))
+        self._height = max(32, int(height))
+        self._padding_x = max(8, int(padding_x))
         self.border_color = self.colors.get("input_border", "#cbd5e1")
         self.focus_color = self.colors.get("primary", "#2563eb")
         self.fill_color = "#ffffff"
@@ -3145,7 +3213,7 @@ class RoundedEntry(tk.Frame):
         self._focused = False
         self._state = "normal"
 
-        self.canvas = tk.Canvas(self, height=40, bg=self.bg_color, highlightthickness=0, bd=0)
+        self.canvas = tk.Canvas(self, height=self._height, bg=self.bg_color, highlightthickness=0, bd=0)
         self.canvas.pack(fill="both", expand=True)
         self.entry = tk.Entry(
             self.canvas,
@@ -3161,7 +3229,7 @@ class RoundedEntry(tk.Frame):
             disabledforeground=self.disabled_text,
             font=("Microsoft JhengHei UI", 10),
         )
-        self.entry_window = self.canvas.create_window(14, 20, anchor="w", window=self.entry)
+        self.entry_window = self.canvas.create_window(self._padding_x, self._height // 2, anchor="w", window=self.entry)
         self.canvas.bind("<Configure>", self._redraw)
         self.entry.bind("<FocusIn>", self._on_focus_in, add="+")
         self.entry.bind("<FocusOut>", self._on_focus_out, add="+")
@@ -3197,14 +3265,19 @@ class RoundedEntry(tk.Frame):
 
     def _redraw(self, _event: tk.Event | None = None) -> None:
         width = max(self.canvas.winfo_width(), 80)
-        height = max(self.canvas.winfo_height(), 40)
+        height = max(self.canvas.winfo_height(), self._height)
         self.canvas.delete("bg")
         border = self.focus_color if self._focused else self.border_color
         fill = self.disabled_fill if self._state == "disabled" else self.fill_color
         self._rounded_rect(1, 1, width - 1, height - 1, self.radius, fill=fill, outline=border, width=1, tags="bg")
         self.canvas.tag_lower("bg")
-        self.canvas.coords(self.entry_window, 14, height // 2)
-        self.canvas.itemconfigure(self.entry_window, width=max(width - 28, 40), height=max(height - 14, 24))
+        vertical_padding = max(12, int(round(height * 0.35)))
+        self.canvas.coords(self.entry_window, self._padding_x, height // 2)
+        self.canvas.itemconfigure(
+            self.entry_window,
+            width=max(width - (self._padding_x * 2), 40),
+            height=max(height - vertical_padding, 24),
+        )
         self.entry.configure(bg=fill)
 
     def _on_focus_in(self, _event: tk.Event) -> None:
@@ -3237,6 +3310,13 @@ class RoundedEntry(tk.Frame):
 
     def selection_range(self, start: int, end: int | str) -> None:
         self.entry.selection_range(start, end)
+
+    def apply_scale_metrics(self, *, height: int, radius: int, padding_x: int) -> None:
+        self._height = max(32, int(height))
+        self.radius = max(4, int(radius))
+        self._padding_x = max(8, int(padding_x))
+        self.canvas.configure(height=self._height)
+        self._redraw()
 
 
 class RunningScriptsOverlay:
@@ -3536,8 +3616,11 @@ class AutoKeyboardApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title(APP_TITLE)
-        self.root.geometry("1120x720")
-        self.root.minsize(980, 620)
+        self._base_tk_scaling = self._current_tk_scaling()
+        self.ui_scale_settings = load_ui_scale_settings()
+        self._apply_tk_scale(self.ui_scale_settings.scale)
+        self.root.geometry(f"{self._scaled(APP_WINDOW_WIDTH)}x{self._scaled(APP_WINDOW_HEIGHT)}")
+        self.root.minsize(self._scaled(APP_WINDOW_MIN_WIDTH), self._scaled(APP_WINDOW_MIN_HEIGHT))
         self._set_window_icon()
 
         self.script_groups, self.active_group_id = load_script_groups()
@@ -3582,11 +3665,14 @@ class AutoKeyboardApp:
         self._step_drag_start_row: str | None = None
         self._step_drag_started_on_selection = False
         self._step_clipboard: list[Step] = []
+        self._ui_scale_choice_by_label: dict[str, float] = {}
         self._group_choice_by_label: dict[str, str] = {}
         self._group_label_by_id: dict[str, str] = {}
         self._script_call_choice_by_label: dict[str, str] = {}
         self._script_call_label_by_id: dict[str, str] = {}
+        self._rounded_entries: list[RoundedEntry] = []
 
+        self.ui_scale_var = tk.StringVar(value=format_ui_scale_label(self.ui_scale_settings.scale))
         self.group_var = tk.StringVar()
         self.name_var = tk.StringVar()
         self.hotkey_var = tk.StringVar()
@@ -3623,6 +3709,7 @@ class AutoKeyboardApp:
         self.recaptcha_monitor.set_settings(self.recaptcha_settings)
         self.recaptcha_monitor.start()
         self._update_recaptcha_status_from_settings(saved=False)
+        self._refresh_ui_scale_choices()
         self._refresh_group_choices()
         self._refresh_script_tree()
         self._select_first_script()
@@ -3658,6 +3745,105 @@ class AutoKeyboardApp:
             self.active_group_id = active_group.id
         return active_group
 
+    def _current_tk_scaling(self) -> float:
+        try:
+            return float(self.root.tk.call("tk", "scaling"))
+        except (tk.TclError, TypeError, ValueError):
+            return 1.0
+
+    def _apply_tk_scale(self, scale: float) -> None:
+        normalized_scale = clamp_ui_scale(scale)
+        try:
+            self.root.tk.call("tk", "scaling", self._base_tk_scaling * normalized_scale)
+        except tk.TclError:
+            pass
+
+    def _scaled(self, value: int) -> int:
+        return max(1, int(round(value * self.ui_scale_settings.scale)))
+
+    def _rounded_entry_metrics(self) -> dict[str, int]:
+        return {
+            "height": self._scaled(40),
+            "radius": self._scaled(9),
+            "padding_x": self._scaled(14),
+        }
+
+    def _apply_rounded_entry_scale(self) -> None:
+        metrics = self._rounded_entry_metrics()
+        for entry in self._rounded_entries:
+            entry.apply_scale_metrics(**metrics)
+
+    def _refresh_ui_scale_choices(self) -> None:
+        if not hasattr(self, "ui_scale_combo"):
+            return
+
+        options = [(format_ui_scale_label(scale), scale) for scale in UI_SCALE_CHOICES]
+        self._ui_scale_choice_by_label = {label: scale for label, scale in options}
+        self.ui_scale_combo.configure(values=[label for label, _scale in options])
+        self.ui_scale_var.set(format_ui_scale_label(self.ui_scale_settings.scale))
+
+    def _apply_scaled_widget_metrics(self) -> None:
+        if hasattr(self, "script_tree"):
+            self.script_tree.column("name", width=self._scaled(180), minwidth=self._scaled(140))
+            self.script_tree.column("hotkey", width=self._scaled(86), minwidth=self._scaled(70), anchor="center")
+            self.script_tree.column("status", width=self._scaled(120), minwidth=self._scaled(100))
+        if hasattr(self, "step_tree"):
+            self.step_tree.column("action", width=self._scaled(120), minwidth=self._scaled(100))
+            self.step_tree.column("key", width=self._scaled(180), minwidth=self._scaled(120))
+            self.step_tree.column("delay", width=self._scaled(110), minwidth=self._scaled(90), anchor="center")
+
+    def _resize_window_for_ui_scale(self, previous_scale: float | None = None, *, initial: bool = False) -> None:
+        min_width = self._scaled(APP_WINDOW_MIN_WIDTH)
+        min_height = self._scaled(APP_WINDOW_MIN_HEIGHT)
+        self.root.minsize(min_width, min_height)
+
+        if initial or previous_scale is None or previous_scale <= 0:
+            self.root.geometry(f"{self._scaled(APP_WINDOW_WIDTH)}x{self._scaled(APP_WINDOW_HEIGHT)}")
+            return
+
+        self.root.update_idletasks()
+        current_width = max(self.root.winfo_width(), min_width)
+        current_height = max(self.root.winfo_height(), min_height)
+        ratio = self.ui_scale_settings.scale / previous_scale
+        new_width = max(int(round(current_width * ratio)), min_width)
+        new_height = max(int(round(current_height * ratio)), min_height)
+        self.root.geometry(f"{new_width}x{new_height}")
+
+    def _set_ui_scale(self, scale: float, *, save: bool, status_message: str | None = None) -> bool:
+        normalized_scale = clamp_ui_scale(scale)
+        previous_scale = self.ui_scale_settings.scale
+        scale_changed = abs(normalized_scale - previous_scale) > 1e-6
+        self.ui_scale_settings = UiScaleSettings(scale=normalized_scale)
+        self._apply_tk_scale(normalized_scale)
+        self._configure_style()
+        if self._rounded_entries:
+            self._apply_rounded_entry_scale()
+        self._apply_scaled_widget_metrics()
+        self._refresh_ui_scale_choices()
+        self._resize_window_for_ui_scale(previous_scale if scale_changed else None, initial=not scale_changed)
+
+        if save:
+            try:
+                save_ui_scale_settings(self.ui_scale_settings)
+            except OSError as exc:
+                self.status_var.set(f"儲存介面大小設定失敗：{exc}")
+                return False
+
+        if status_message is not None:
+            self.status_var.set(status_message)
+        return True
+
+    def _on_ui_scale_selected(self, _event: tk.Event | None = None) -> None:
+        scale = self._ui_scale_choice_by_label.get(self.ui_scale_var.get())
+        if scale is None:
+            self._refresh_ui_scale_choices()
+            return
+        if abs(scale - self.ui_scale_settings.scale) <= 1e-6:
+            self._refresh_ui_scale_choices()
+            return
+
+        self._set_ui_scale(scale, save=True, status_message=f"已將介面大小調整為 {format_ui_scale_label(scale)}。")
+
     def _set_window_icon(self) -> None:
         icon_path = resource_path("assets/AutoKeyboard.ico")
         if not icon_path.exists():
@@ -3689,6 +3875,7 @@ class AutoKeyboardApp:
             "warning_text": "#92400e",
         }
         colors = self.colors
+        px = self._scaled
 
         self.root.configure(bg=colors["bg"])
         try:
@@ -3717,25 +3904,25 @@ class AutoKeyboardApp:
             "Banner.Idle.TLabel",
             background=colors["idle_bg"],
             foreground=colors["idle_text"],
-            padding=(12, 7),
+            padding=(px(12), px(7)),
             font=("Microsoft JhengHei UI", 10, "bold"),
         )
         style.configure(
             "Banner.Running.TLabel",
             background=colors["success_bg"],
             foreground=colors["success_text"],
-            padding=(12, 7),
+            padding=(px(12), px(7)),
             font=("Microsoft JhengHei UI", 10, "bold"),
         )
         style.configure(
             "Status.TLabel",
             background=colors["bg"],
             foreground=colors["muted"],
-            padding=(16, 9),
+            padding=(px(16), px(9)),
         )
         style.configure(
             "TEntry",
-            padding=(8, 6),
+            padding=(px(8), px(6)),
             fieldbackground="#ffffff",
             foreground=colors["text"],
             bordercolor=colors["line"],
@@ -3746,7 +3933,7 @@ class AutoKeyboardApp:
         style.map("TEntry", bordercolor=[("focus", colors["primary"])])
         style.configure(
             "Recipient.TCombobox",
-            padding=(8, 6),
+            padding=(px(8), px(6)),
             fieldbackground="#ffffff",
             background="#ffffff",
             foreground=colors["text"],
@@ -3767,25 +3954,25 @@ class AutoKeyboardApp:
             arrowcolor=[("active", colors["primary_hover"])],
         )
 
-        style.configure("TButton", padding=(12, 7), borderwidth=0, focusthickness=0, relief="flat")
+        style.configure("TButton", padding=(px(12), px(7)), borderwidth=0, focusthickness=0, relief="flat")
         style.map(
             "TButton",
             background=[("active", "#e2e8f0"), ("pressed", "#cbd5e1")],
             foreground=[("disabled", "#94a3b8")],
         )
-        style.configure("Primary.TButton", background=colors["primary"], foreground="#ffffff", padding=(14, 8))
+        style.configure("Primary.TButton", background=colors["primary"], foreground="#ffffff", padding=(px(14), px(8)))
         style.map(
             "Primary.TButton",
             background=[("active", colors["primary_hover"]), ("pressed", colors["primary_hover"])],
             foreground=[("disabled", "#dbeafe")],
         )
-        style.configure("Danger.TButton", background="#fee2e2", foreground=colors["danger"], padding=(14, 8))
+        style.configure("Danger.TButton", background="#fee2e2", foreground=colors["danger"], padding=(px(14), px(8)))
         style.map(
             "Danger.TButton",
             background=[("active", "#fecaca"), ("pressed", "#fecaca")],
             foreground=[("active", colors["danger_hover"])],
         )
-        style.configure("Ghost.TButton", background=colors["surface_alt"], foreground=colors["text"], padding=(14, 8))
+        style.configure("Ghost.TButton", background=colors["surface_alt"], foreground=colors["text"], padding=(px(14), px(8)))
         style.map("Ghost.TButton", background=[("active", "#e2e8f0"), ("pressed", "#cbd5e1")])
 
         style.configure(
@@ -3794,14 +3981,14 @@ class AutoKeyboardApp:
             fieldbackground=colors["surface"],
             foreground=colors["text"],
             borderwidth=0,
-            rowheight=30,
+            rowheight=px(30),
             relief="flat",
         )
         style.configure(
             "Treeview.Heading",
             background=colors["surface_alt"],
             foreground=colors["muted"],
-            padding=(8, 7),
+            padding=(px(8), px(7)),
             relief="flat",
             font=("Microsoft JhengHei UI", 9, "bold"),
         )
@@ -3817,7 +4004,7 @@ class AutoKeyboardApp:
             "Large.TRadiobutton",
             background=colors["surface"],
             foreground=colors["text"],
-            padding=(14, 10),
+            padding=(px(14), px(10)),
             font=("Microsoft JhengHei UI", 12),
         )
         style.map("Large.TRadiobutton", background=[("active", colors["surface"])])
@@ -3826,7 +4013,7 @@ class AutoKeyboardApp:
         colors = self.colors
         images = self._build_checkbutton_images()
         self._checkbutton_images = images
-        element_name = "AutoKeyboard.Checkbutton.indicator"
+        element_name = f"AutoKeyboard.Checkbutton.indicator.{int(round(self.ui_scale_settings.scale * 100))}"
         try:
             style.element_create(
                 element_name,
@@ -3866,7 +4053,7 @@ class AutoKeyboardApp:
             "TCheckbutton",
             background=colors["surface"],
             foreground=colors["text"],
-            padding=(0, 4),
+            padding=(0, self._scaled(4)),
         )
         style.map(
             "TCheckbutton",
@@ -3909,16 +4096,20 @@ class AutoKeyboardApp:
         highlight: str,
         check: str | None = None,
     ) -> tk.PhotoImage:
-        image = tk.PhotoImage(width=24, height=24)
-        self._fill_photo_rect(image, 2, 2, 22, 22, border)
-        self._fill_photo_rect(image, 3, 3, 21, 21, fill)
-        self._fill_photo_rect(image, 4, 4, 20, 5, highlight)
-        self._fill_photo_rect(image, 4, 4, 5, 20, highlight)
+        size = self._scaled(24)
+        scale_px = lambda value: max(1, int(round(value * size / 24)))
+        image = tk.PhotoImage(width=size, height=size)
+        self._fill_photo_rect(image, scale_px(2), scale_px(2), scale_px(22), scale_px(22), border)
+        self._fill_photo_rect(image, scale_px(3), scale_px(3), scale_px(21), scale_px(21), fill)
+        self._fill_photo_rect(image, scale_px(4), scale_px(4), scale_px(20), scale_px(5), highlight)
+        self._fill_photo_rect(image, scale_px(4), scale_px(4), scale_px(5), scale_px(20), highlight)
         if check is not None:
             self._draw_checkbox_checkmark(image, check)
         return image
 
     def _draw_checkbox_checkmark(self, image: tk.PhotoImage, color: str) -> None:
+        size = int(str(image.cget("width")))
+        scale_px = lambda value: max(1, int(round(value * size / 24)))
         for x1, y1, x2, y2 in (
             (6, 12, 8, 14),
             (8, 14, 10, 16),
@@ -3928,7 +4119,7 @@ class AutoKeyboardApp:
             (15, 11, 17, 13),
             (17, 9, 19, 11),
         ):
-            self._fill_photo_rect(image, x1, y1, x2, y2, color)
+            self._fill_photo_rect(image, scale_px(x1), scale_px(y1), scale_px(x2), scale_px(y2), color)
 
     def _fill_photo_rect(
         self,
@@ -3954,20 +4145,31 @@ class AutoKeyboardApp:
         )
         header_actions = ttk.Frame(header, style="Header.TFrame")
         header_actions.grid(row=0, column=1, sticky="e")
+        ttk.Label(header_actions, text="介面大小", style="Small.TLabel").grid(row=0, column=0, sticky="e", padx=(0, 8))
+        self.ui_scale_combo = ttk.Combobox(
+            header_actions,
+            textvariable=self.ui_scale_var,
+            values=(),
+            state="readonly",
+            width=7,
+            style="Recipient.TCombobox",
+        )
+        self.ui_scale_combo.grid(row=0, column=1, sticky="e", padx=(0, 12))
+        self.ui_scale_combo.bind("<<ComboboxSelected>>", self._on_ui_scale_selected)
         self.update_button = ttk.Button(
             header_actions,
             text="檢查更新",
             style="Ghost.TButton",
             command=self._check_for_updates,
         )
-        self.update_button.grid(row=0, column=0, sticky="e", padx=(0, 8))
+        self.update_button.grid(row=0, column=2, sticky="e", padx=(0, 8))
         self.banner_label = ttk.Label(
             header_actions,
             textvariable=self.banner_var,
             style="Banner.Idle.TLabel",
             anchor="center",
         )
-        self.banner_label.grid(row=0, column=1, sticky="e")
+        self.banner_label.grid(row=0, column=3, sticky="e")
 
         paned = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
         paned.grid(row=1, column=0, sticky="nsew", padx=16, pady=16)
@@ -4012,9 +4214,9 @@ class AutoKeyboardApp:
         self.script_tree.heading("name", text="名稱")
         self.script_tree.heading("hotkey", text="快捷鍵")
         self.script_tree.heading("status", text="狀態")
-        self.script_tree.column("name", width=180, minwidth=140)
-        self.script_tree.column("hotkey", width=86, anchor="center", minwidth=70)
-        self.script_tree.column("status", width=120, minwidth=100)
+        self.script_tree.column("name", width=self._scaled(180), minwidth=self._scaled(140))
+        self.script_tree.column("hotkey", width=self._scaled(86), anchor="center", minwidth=self._scaled(70))
+        self.script_tree.column("status", width=self._scaled(120), minwidth=self._scaled(100))
         self.script_tree.tag_configure("running", background="#dbeafe")
         self.script_tree.tag_configure("stopping", background="#fef3c7")
         self.script_tree.tag_configure("script_dragging", background="#bfdbfe")
@@ -4143,7 +4345,7 @@ class AutoKeyboardApp:
         ttk.Label(editor, text="腳本名稱", style="Panel.TLabel").grid(
             row=0, column=0, sticky="w", padx=(0, 10), pady=(0, 10)
         )
-        self.name_entry = RoundedEntry(editor, textvariable=self.name_var, colors=self.colors)
+        self.name_entry = RoundedEntry(editor, textvariable=self.name_var, colors=self.colors, **self._rounded_entry_metrics())
         self.name_entry.grid(row=0, column=1, sticky="ew", pady=(0, 8))
 
         ttk.Label(editor, text="快捷鍵", style="Panel.TLabel").grid(
@@ -4152,7 +4354,12 @@ class AutoKeyboardApp:
         hotkey_row = ttk.Frame(editor, style="Panel.TFrame")
         hotkey_row.grid(row=1, column=1, sticky="ew", pady=(0, 8))
         hotkey_row.columnconfigure(0, weight=1)
-        self.hotkey_entry = RoundedEntry(hotkey_row, textvariable=self.hotkey_var, colors=self.colors)
+        self.hotkey_entry = RoundedEntry(
+            hotkey_row,
+            textvariable=self.hotkey_var,
+            colors=self.colors,
+            **self._rounded_entry_metrics(),
+        )
         self.hotkey_entry.grid(row=0, column=0, sticky="ew", padx=(0, 8))
         self.hotkey_entry.bind("<KeyPress>", self._capture_hotkey_from_entry)
         self.hotkey_entry.bind("<FocusOut>", self._cancel_hotkey_recording)
@@ -4179,9 +4386,9 @@ class AutoKeyboardApp:
         self.step_tree.heading("action", text="動作")
         self.step_tree.heading("key", text="內容")
         self.step_tree.heading("delay", text="延遲")
-        self.step_tree.column("action", width=120, minwidth=100)
-        self.step_tree.column("key", width=180, minwidth=120)
-        self.step_tree.column("delay", width=110, minwidth=90, anchor="center")
+        self.step_tree.column("action", width=self._scaled(120), minwidth=self._scaled(100))
+        self.step_tree.column("key", width=self._scaled(180), minwidth=self._scaled(120))
+        self.step_tree.column("delay", width=self._scaled(110), minwidth=self._scaled(90), anchor="center")
         self.step_tree.tag_configure("step_odd", background="#ffffff")
         self.step_tree.tag_configure("step_even", background="#f8fafc")
         self.step_tree.tag_configure("step_dragging", background="#bfdbfe")
@@ -4256,6 +4463,7 @@ class AutoKeyboardApp:
             textvariable=self.step_key_var,
             width=18,
             colors=self.colors,
+            **self._rounded_entry_metrics(),
         )
         self.step_key_entry.grid(row=1, column=1, sticky="ew", padx=(0, 6), pady=(8, 0))
         self.step_key_entry.bind("<KeyPress>", self._capture_step_key_from_entry)
@@ -4279,6 +4487,7 @@ class AutoKeyboardApp:
             textvariable=self.step_delay_ms_var,
             width=12,
             colors=self.colors,
+            **self._rounded_entry_metrics(),
         )
         self.step_delay_entry.grid(
             row=0, column=1, sticky="ew"
@@ -4335,6 +4544,13 @@ class AutoKeyboardApp:
         ttk.Label(self.root, textvariable=self.status_var, style="Status.TLabel", anchor="w").grid(
             row=2, column=0, sticky="ew"
         )
+
+        self._rounded_entries = [
+            self.name_entry,
+            self.hotkey_entry,
+            self.step_key_entry,
+            self.step_delay_entry,
+        ]
 
     def _selected_script_id(self) -> str | None:
         selection = self.script_tree.selection()
@@ -4462,7 +4678,7 @@ class AutoKeyboardApp:
         ttk.Label(frame, text=prompt, style="Small.TLabel").grid(row=1, column=0, sticky="w", pady=(4, 0))
 
         value_var = tk.StringVar(value=initial_value)
-        entry = RoundedEntry(frame, textvariable=value_var, colors=self.colors)
+        entry = RoundedEntry(frame, textvariable=value_var, colors=self.colors, **self._rounded_entry_metrics())
         entry.grid(row=2, column=0, sticky="ew", pady=(12, 0))
 
         error_var = tk.StringVar(value="")
@@ -4470,7 +4686,7 @@ class AutoKeyboardApp:
             frame,
             textvariable=error_var,
             style="Error.Small.TLabel",
-            wraplength=320,
+            wraplength=self._scaled(320),
         ).grid(row=3, column=0, sticky="w", pady=(8, 0))
 
         buttons = ttk.Frame(frame, style="Toolbar.TFrame")

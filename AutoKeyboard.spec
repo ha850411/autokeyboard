@@ -8,6 +8,7 @@ a = Analysis(
     datas=[
         ('assets/AutoKeyboard.ico', 'assets'),
         ('assets/check/recaptcha.png', 'assets/check'),
+        ('version.txt', '.'),
     ],
     hiddenimports=[],
     hookspath=[],
