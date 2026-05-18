@@ -313,9 +313,14 @@ class ConfigPersistenceTests(unittest.TestCase):
                 settings_path.write_text(ak.json.dumps({"scale": 99}, ensure_ascii=False), encoding="utf-8")
                 clamped = ak.load_ui_scale_settings()
 
+                settings_path.write_text(ak.json.dumps({"scale": 0.1}, ensure_ascii=False), encoding="utf-8")
+                low_clamped = ak.load_ui_scale_settings()
+
         self.assertEqual(loaded, ak.UiScaleSettings(scale=1.25))
         self.assertEqual(saved_data, {"scale": 1.25})
         self.assertEqual(clamped, ak.UiScaleSettings(scale=ak.UI_SCALE_MAX))
+        self.assertEqual(low_clamped, ak.UiScaleSettings(scale=0.5))
+        self.assertIn(0.5, ak.UI_SCALE_CHOICES)
 
     def test_ui_scale_settings_invalid_config_returns_default(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

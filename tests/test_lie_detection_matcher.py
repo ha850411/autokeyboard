@@ -104,6 +104,23 @@ def screenshot_with_scaled_lie_detection(scale: float, *, checked: bool = False)
     return canvas
 
 
+def orange_map_screenshot_with_scaled_lie_detection(scale: float) -> Image.Image:
+    canvas = Image.new("RGBA", (1366, 768), (179, 68, 26, 255))
+    draw = ImageDraw.Draw(canvas)
+    draw.ellipse((250, 70, 805, 515), fill=(239, 102, 13, 255))
+    draw.rectangle((0, 400, 1366, 768), fill=(204, 116, 48, 255))
+    draw.polygon(
+        (0, 560, 265, 460, 575, 610, 830, 475, 1366, 630, 1366, 768, 0, 768),
+        fill=(111, 42, 34, 255),
+    )
+
+    template = Image.open(RECAPTCHA_TEMPLATE_PATH).convert("RGBA")
+    resample = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
+    scaled = template.resize((int(template.width * scale), int(template.height * scale)), resample)
+    canvas.alpha_composite(scaled, (520, 200))
+    return canvas.convert("RGB")
+
+
 class LieDetectionMatcherTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -138,6 +155,14 @@ class LieDetectionMatcherTests(unittest.TestCase):
                 result = self.compact_matcher.analyze(screenshot_with_scaled_lie_detection(scale, checked=True))
 
                 self.assertTrue(result.matched)
+
+    def test_detects_orange_map_lie_detection_after_smaller_scale_hint(self) -> None:
+        matcher = LieDetectionMatcher(RECAPTCHA_TEMPLATE_PATH)
+        self.assertTrue(matcher.analyze(screenshot_with_scaled_lie_detection(0.8)).matched)
+
+        result = matcher.analyze(orange_map_screenshot_with_scaled_lie_detection(1.5))
+
+        self.assertTrue(result.matched)
 
     def test_generated_scale_candidates_do_not_leave_large_gaps(self) -> None:
         scales = build_recaptcha_match_scales()

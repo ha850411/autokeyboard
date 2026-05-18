@@ -227,7 +227,7 @@ RECAPTCHA_CV_MATCH_THRESHOLD = 0.94
 RECAPTCHA_MASKED_CV_MATCH_THRESHOLD = 0.90
 RECAPTCHA_RELAXED_MASKED_CCORR_THRESHOLD = 0.91
 RECAPTCHA_RELAXED_MASKED_SCALE_MIN = 0.7
-RECAPTCHA_RELAXED_MASKED_SCALE_LIMIT = 8
+RECAPTCHA_RELAXED_MASKED_SCALE_LIMIT = 12
 RECAPTCHA_TINY_CV_MATCH_THRESHOLD = 0.88
 RECAPTCHA_SMALL_CV_MATCH_THRESHOLD = 0.9
 RECAPTCHA_TINY_MASKED_CV_MATCH_THRESHOLD = 0.86
@@ -249,10 +249,10 @@ RECAPTCHA_MAX_NOTIFICATION_WORKERS = 3
 RUNNER_STOP_WAIT_SECONDS = 0.5
 DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
 PROCESS_PER_MONITOR_DPI_AWARE = 2
-UI_SCALE_MIN = 0.8
+UI_SCALE_MIN = 0.5
 UI_SCALE_MAX = 1.5
 UI_SCALE_DEFAULT = 1.0
-UI_SCALE_CHOICES = (0.8, 0.9, 1.0, 1.1, 1.25, 1.5)
+UI_SCALE_CHOICES = (0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5)
 APP_WINDOW_WIDTH = 1120
 APP_WINDOW_HEIGHT = 720
 APP_WINDOW_MIN_WIDTH = 980
@@ -3691,8 +3691,6 @@ class AutoKeyboardApp:
         self.recaptcha_enabled_var = tk.BooleanVar(value=self.recaptcha_settings.enabled)
         self.recaptcha_maplestory_only_var = tk.BooleanVar(value=self.recaptcha_settings.only_maplestory_window)
         self.recaptcha_recipient_name_var = tk.StringVar(value=self.recaptcha_settings.recipient_name)
-        self.recaptcha_bound_user_id_var = tk.StringVar(value="")
-        self.recaptcha_bound_webhook_var = tk.StringVar(value="")
         self.recaptcha_status_var = tk.StringVar(value="")
         self.banner_var = tk.StringVar(value="待命")
         self.status_var = tk.StringVar(value="準備就緒")
@@ -3705,7 +3703,6 @@ class AutoKeyboardApp:
             opacity=self.running_overlay_settings.opacity,
         )
         self._bind_auto_save()
-        self._refresh_recaptcha_binding_display()
         self.recaptcha_monitor.set_settings(self.recaptcha_settings)
         self.recaptcha_monitor.start()
         self._update_recaptcha_status_from_settings(saved=False)
@@ -4311,29 +4308,12 @@ class AutoKeyboardApp:
             style="Recipient.TCombobox",
         )
         self.recaptcha_recipient_combo.grid(row=3, column=1, sticky="ew")
-        ttk.Label(monitor_frame, text="綁定 User", style="Panel.TLabel").grid(
-            row=4, column=0, sticky="w", padx=(0, 8), pady=(8, 0)
-        )
-        ttk.Label(
-            monitor_frame,
-            textvariable=self.recaptcha_bound_user_id_var,
-            style="Small.TLabel",
-        ).grid(row=4, column=1, sticky="w", pady=(8, 0))
-        ttk.Label(monitor_frame, text="Webhook", style="Panel.TLabel").grid(
-            row=5, column=0, sticky="nw", padx=(0, 8), pady=(8, 0)
-        )
-        ttk.Label(
-            monitor_frame,
-            textvariable=self.recaptcha_bound_webhook_var,
-            style="Small.TLabel",
-            wraplength=240,
-        ).grid(row=5, column=1, sticky="ew", pady=(8, 0))
         ttk.Label(
             monitor_frame,
             textvariable=self.recaptcha_status_var,
             style="Small.TLabel",
             wraplength=240,
-        ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
         right.columnconfigure(0, weight=1)
         right.rowconfigure(3, weight=1)
@@ -5724,7 +5704,6 @@ class AutoKeyboardApp:
             only_maplestory_window=bool(self.recaptcha_maplestory_only_var.get()),
         )
         self.recaptcha_settings = settings
-        self._refresh_recaptcha_binding_display()
         try:
             save_recaptcha_monitor_settings(settings)
         except OSError as exc:
@@ -5733,15 +5712,6 @@ class AutoKeyboardApp:
 
         self.recaptcha_monitor.set_settings(settings)
         self._update_recaptcha_status_from_settings(saved=True)
-
-    def _refresh_recaptcha_binding_display(self) -> None:
-        recipient = discord_recipient_for_name(self.recaptcha_recipient_name_var.get())
-        if recipient is None:
-            self.recaptcha_bound_user_id_var.set("尚未選擇")
-            self.recaptcha_bound_webhook_var.set("尚未選擇")
-            return
-        self.recaptcha_bound_user_id_var.set(f"{recipient.name} / {recipient.user_id}")
-        self.recaptcha_bound_webhook_var.set(recipient.webhook_url)
 
     def _update_recaptcha_status_from_settings(self, *, saved: bool) -> None:
         if not self.recaptcha_enabled_var.get():
